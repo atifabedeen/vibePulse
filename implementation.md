@@ -158,7 +158,7 @@ Expo is a production-grade React Native framework, and EAS Build produces App St
 
 ### Backend
 
-- Python 3.12
+- Python 3.9
 - FastAPI
 - Pydantic v2
 - SQLAlchemy 2.0
@@ -715,7 +715,13 @@ The agent system is a single graph, `recommend_v1`, defined in `services/agents/
 
 ### 8.1 State schema (`state.py`)
 
+`from __future__ import annotations` defers evaluation of annotations, which lets us
+keep the modern `X | None` union syntax even on Python 3.9. Every backend module
+that uses these annotations should include the same import at the top.
+
 ```python
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
 from typing import Literal
 from uuid import UUID
@@ -1086,7 +1092,7 @@ Each milestone is one or more PRs, ends in a release tag, and has an explicit De
 
 ### 14.1 Prerequisites
 
-- Python 3.12 (`pyenv` recommended)
+- Python 3.9 (matches the system Python on the dev machine; bump intentionally if needed)
 - Node 20 LTS + npm/pnpm (only when working on `apps/mobile`)
 - Docker Desktop (only from M2 onward)
 - An OpenAI API key and a Google Cloud project with Places API enabled (free tier for development)

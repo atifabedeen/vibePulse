@@ -4,7 +4,7 @@
 
 [tool.ruff]
 line-length = 100
-target-version = "py312"
+target-version = "py39"
 extend-exclude = [".venv", "alembic/versions", "**/migrations/**"]
 
 [tool.ruff.lint]
@@ -29,7 +29,7 @@ ignore = [
 
 [tool.black]
 line-length = 100
-target-version = ["py312"]
+target-version = ["py39"]
 extend-exclude = '''
 /(
     \.venv
@@ -39,7 +39,7 @@ extend-exclude = '''
 '''
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.9"
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true

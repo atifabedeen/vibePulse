@@ -30,7 +30,7 @@ roadmap in `implementation.md` sec 13.
 ## Tech stack at a glance
 
 Mobile: React Native + Expo + TypeScript.
-Backend: Python 3.12, FastAPI, SQLAlchemy 2, Alembic, PostgreSQL 16 +
+Backend: Python 3.9, FastAPI, SQLAlchemy 2, Alembic, PostgreSQL 16 +
 pgvector, Redis 7, Celery/Dramatiq.
 Agents: LangGraph + OpenAI, MCP server.
 Ops: OpenTelemetry, Prometheus, Grafana, Docker, GitHub Actions.
