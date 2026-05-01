@@ -840,4 +840,301 @@ Each tool has: name, JSON input schema, JSON output schema, side effects.
 | `restaurant_tradeoff_explanation` | Used by `explain_candidates` per place | `place`, `group_constraints` |
 | `incident_summary` | Used by `reliability_check` to write incident `details` | `signals`, `recent_runs` |
 
-[§10–§14 added in Phase A2]
+---
+
+## 10. Observability
+
+OpenTelemetry is the single source of truth: every service is instrumented to emit traces, metrics, and logs to an **OTel Collector**, which fans out to Prometheus (metrics), a logs backend (Loki / OpenSearch), and a traces backend (Tempo / Jaeger). Grafana reads all three.
+
+### 10.1 Span naming
+
+Convention: `<service>.<component>.<operation>`. Examples:
+
+- `api.http.POST /api/v1/missions` (auto from FastAPI instrumentor)
+- `api.db.query users.select_by_email`
+- `agents.graph.recommend_v1`
+- `agents.node.parse_preferences`
+- `agents.tool.openai.chat_completion`
+- `mcp.tool.search_places`
+- `worker.job.refresh_places_cache`
+
+Mandatory span attributes on every span: `service.name`, `service.version`, `deployment.environment`, `mission_id` (when present), `agent_run_id` (when present), `user_id` (when authenticated, hashed).
+
+### 10.2 Metrics
+
+Prometheus client metrics, all with `service` and `env` labels:
+
+| Metric | Type | Labels (extra) | Purpose |
+|---|---|---|---|
+| `http_requests_total` | counter | `method, path, status` | API request volume |
+| `http_request_duration_seconds` | histogram | `method, path` | API latency |
+| `db_query_duration_seconds` | histogram | `op, table` | DB latency |
+| `places_api_calls_total` | counter | `endpoint, status` | Google Places usage |
+| `places_cache_hit_ratio` | gauge | — | Computed by worker job |
+| `agent_runs_total` | counter | `graph, status` | LangGraph completions |
+| `agent_run_duration_seconds` | histogram | `graph` | End-to-end graph latency |
+| `agent_node_duration_seconds` | histogram | `graph, node` | Per-node latency |
+| `llm_tokens_total` | counter | `model, kind` (prompt/completion) | Cost tracking |
+| `llm_cost_usd_total` | counter | `model` | Cost tracking |
+| `incidents_open` | gauge | `kind, severity` | Operational health |
+| `mcp_tool_calls_total` | counter | `tool, status` | MCP usage |
+
+### 10.3 Logs
+
+Structured JSON via `structlog`. Mandatory fields: `ts`, `level`, `service`, `env`, `trace_id`, `span_id`, `event`. Domain fields when applicable: `mission_id`, `user_id`, `agent_run_id`, `node_name`. Never log raw preferences or PII — log IDs and let dashboards join.
+
+### 10.4 Dashboards
+
+JSON committed under `infra/grafana/dashboards/`:
+
+- `api-dashboard.json`: RPS, p50/p95/p99 latency by route, error rate, top slow routes.
+- `agent-dashboard.json`: runs/min by status, p95 graph duration, per-node latency heatmap, LLM token spend, top failure modes.
+- `places-dashboard.json`: Google Places call rate, error rate, cache hit ratio, expiring cache count.
+- `mobile-dashboard.json`: client-reported errors and screen latency (Sentry-or-equivalent webhook into the API).
+
+### 10.5 Alert rules
+
+Defined in `infra/prometheus/alert_rules.yml`. Each alert links to a runbook in `docs/runbooks/`.
+
+| Alert | Expr (sketch) | Severity | Runbook |
+|---|---|---|---|
+| `PlacesAPIDegraded` | `rate(places_api_calls_total{status=~"5.."}[5m]) > 0.05` | warn | `places-api-degraded.md` |
+| `AgentOutputInvalid` | `rate(agent_runs_total{status="failed",reason="schema"}[10m]) > 0.1` | warn | `agent-output-invalid.md` |
+| `RankingConfidenceLow` | sustained low `score` p95 < 40 | info | `ranking-confidence-low.md` |
+| `PushNotificationFailed` | `rate(... push_failures_total[10m]) > 0.2` | warn | `push-notification-failed.md` |
+| `DatabaseLatencyHigh` | `histogram_quantile(0.95, rate(db_query_duration_seconds_bucket[5m])) > 0.5` | error | `database-latency-high.md` |
+| `APIErrorRateHigh` | `rate(http_requests_total{status=~"5.."}[5m]) > 0.02` | error | (generic) |
+
+### 10.6 Trace context propagation
+
+Five hops (mobile → api → agents → mcp → worker) means a single user action can produce a fragmented trace if any link drops context. Rules:
+
+- **Mobile → API**: client generates a `traceparent` (W3C Trace Context) header on every outbound request and attaches it to every retry of the same logical action with the same trace ID.
+- **API → DB**: SQLAlchemy instrumentor automatically nests `db.query` spans under the active HTTP span.
+- **API → Agents**: when API enqueues a graph run (or invokes in-process), the current span's `traceparent` is serialized into the `agent_runs.input` JSON under `_trace.traceparent`. The graph entry node restores it.
+- **Agents → MCP**: MCP stdio/SSE messages carry `traceparent` in a custom `_meta.traceparent` field; the MCP server SDK is wrapped to extract and use it.
+- **API → Worker (Celery/Dramatiq)**: task headers carry `traceparent`. Worker entrypoint extracts it before the job runs.
+
+If a hop drops the context, that's a bug; `reliability_check` logs an incident.
+
+---
+
+## 11. Security & secrets
+
+### 11.1 Auth
+
+JWT-based, two-token model:
+
+- **Access token**: 15-minute expiry, signed with `JWT_SECRET` (HS256 in dev, RS256 in prod with a KMS-managed key). Carried in `Authorization: Bearer ...`.
+- **Refresh token**: 30-day expiry, opaque random string; stored hashed in `users.refresh_token_hash` (added to schema in §6 v2). Rotated on every refresh.
+
+Password hashing: `argon2id`. Email verification: out of scope for v1; mark accounts `email_verified=false` and gate sensitive endpoints behind verification when added.
+
+### 11.2 Authorization
+
+Mission-scoped: every endpoint under `/api/v1/missions/{id}/*` checks `mission_members` membership. Owner-only routes additionally check `role='owner'`. No cross-tenant access.
+
+### 11.3 Rate limiting
+
+Redis-backed token bucket via `slowapi`. Limits:
+
+- Anonymous (login/register): 10 req/min per IP.
+- Authenticated user: 120 req/min per user.
+- Places search endpoints: 30 req/min per mission.
+- Agent run triggers (`POST /missions/{id}/replan`): 5 per mission per hour.
+
+Returns `429` with `Retry-After`. Limit hits emit a span event and increment `rate_limit_hits_total`.
+
+### 11.4 Env var inventory
+
+Every var listed here must appear in `.env.example`. Real values live only in deploy secret stores (AWS Secrets Manager / GitHub Actions secrets).
+
+| Var | Used by | Purpose |
+|---|---|---|
+| `DATABASE_URL` | api, agents, worker | Postgres connection |
+| `LANGGRAPH_DATABASE_URL` | agents | Defaults to `DATABASE_URL`; override if checkpointer goes elsewhere |
+| `REDIS_URL` | api, worker | Cache + Celery broker |
+| `JWT_SECRET` | api | Access-token signing key |
+| `JWT_REFRESH_SECRET` | api | Refresh-token signing key |
+| `OPENAI_API_KEY` | agents, mcp | LLM calls |
+| `OPENAI_MODEL` | agents, mcp | Default model id |
+| `GOOGLE_PLACES_API_KEY` | api, agents, mcp | Restaurant search |
+| `EXPO_ACCESS_TOKEN` | worker | Push notifications |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | all | OTel Collector address |
+| `OTEL_SERVICE_NAME` | each service sets its own | span attribute |
+| `LOG_LEVEL` | all | structlog level |
+| `ENV` | all | `dev` / `staging` / `prod` |
+| `SENTRY_DSN` | mobile, api | Error reporting (optional) |
+| `MCP_SERVER_PORT` | mcp | SSE/HTTP port (stdio mode if unset) |
+
+### 11.5 PII & data retention
+
+VibeBite stores: email, display name, location coordinates, group preferences (incl. dietary restrictions which are sensitive in some jurisdictions), and Google Places blobs.
+
+- **Email/display name**: retained until account deletion. DSR endpoint (`DELETE /users/me`) sets `users.deleted_at`, scrubs `email`/`display_name`/`avatar_url`, and orphans foreign keys via `on delete restrict` so analytics tables stay valid but can't re-identify.
+- **Location**: only stored on `missions.location_lat/lng`; not retained on user accounts.
+- **Preferences**: cascade-deleted with mission (90 days post-decision).
+- **Places blobs**: 7-day TTL; Google ToS allows caching but not indefinite storage.
+- **Agent runs**: 30-day TTL; logs may include parsed preferences in `input`/`output` JSON, so retention here is the binding constraint.
+- **Logs**: 30-day TTL in the logs backend.
+
+DSR turnaround target: 30 days. Background job `gdpr_purge.py` (added in M7) iterates `users.deleted_at IS NOT NULL`.
+
+### 11.6 Secrets handling in CI
+
+GitHub Actions secrets only. `.env` is in `.gitignore`. Pre-commit hook (`detect-secrets` or `gitleaks`) added in M0.5 to block commits containing high-entropy strings.
+
+---
+
+## 12. Testing strategy
+
+| Layer | Tool | Scope | Target |
+|---|---|---|---|
+| Unit (Python) | pytest | pure functions in `services/api/app/services/`, scoring logic, parsing | 80% line coverage on `services/` and `repositories/` |
+| Integration (Python) | pytest + testcontainers (Postgres, Redis) | API routes end-to-end against real DB | All `/api/v1/*` happy paths + 1 failure path each |
+| Agent evals | pytest + recorded LLM responses (vcr-style) | Each LangGraph node in isolation, plus end-to-end graph on fixture missions | Listed under `services/agents/vibebite_agents/evals/` |
+| Contract | OpenAPI schema diff in CI | Prevents breaking the mobile client | Hard fail on incompatible change |
+| Mobile unit | Jest + React Testing Library | Components, hooks, Zod schemas | 60% line coverage |
+| Mobile E2E | Maestro | Critical flows: create mission, invite, vote, see winner | All 4 flows green per build |
+| Load | k6 | `tests/load/k6-missions.js`, `k6-ranking.js` | API p95 < 300ms at 50 RPS sustained |
+| Chaos / reliability | manual + scripted | Kill Places API, force LLM 429, sever Redis | Each maps to a runbook in `docs/runbooks/` |
+
+CI pipeline (M0.5):
+
+1. Lint (ruff, black --check, mypy, eslint, prettier --check).
+2. Unit tests (Python + JS) in parallel.
+3. Integration tests with services up via docker-compose.
+4. Mobile bundle check (Expo prebuild).
+5. OpenAPI schema check.
+6. Build container images and push to GHCR on `main` only.
+
+---
+
+## 13. Milestone roadmap
+
+Each milestone is one or more PRs, ends in a release tag, and has an explicit Definition of Done. Commits within a milestone push to `main`; milestone completion bumps the tag.
+
+### M0 — Repo scaffold
+- `.gitignore`, `.env.example`, `.editorconfig`, README, `requirements-dev.txt`, root `pyproject.toml` with shared tool config, Python venv.
+- **DoD**: clone → `python3 -m venv .venv && pip install -r requirements-dev.txt` → `ruff check .` returns 0 issues on the (empty) tree.
+
+### M0.5 — CI skeleton
+- `.github/workflows/ci.yml`: lint + tests on PR; container build on `main`.
+- pre-commit config; `gitleaks` secret scan.
+- **DoD**: a no-op PR turns CI green.
+
+### M1 — Auth + missions
+- `services/api/` scaffold (FastAPI + SQLAlchemy + Alembic).
+- Migrations for `users`, `missions`, `mission_members`, `mission_invites`.
+- Endpoints: `auth.py` (full), `users.py` (full), `missions.py` (POST, GET, GET by id, invites, redeem).
+- Integration tests for all endpoints.
+- **DoD**: a curl flow can register, login, create mission, generate invite, redeem from a second account.
+
+### M2 — Places integration
+- Migrations for `places`, `preferences`.
+- Endpoints: `preferences.py`, `places.py`.
+- `places_service.py` with Google Places client, Redis cache, retry/backoff.
+- Worker job `refresh_places_cache.py`.
+- **DoD**: hitting `GET /missions/{id}/places` returns cached results on second call within 5 minutes; cache hit metric flips.
+
+### M3 — LangGraph parser + ranker
+- `services/agents/` scaffold.
+- Migrations for `rankings`, `agent_runs`, `agent_run_steps`.
+- Nodes: `parse_preferences`, `search_places`, `normalize_places`, `score_candidates`, `explain_candidates`, `reliability_check`.
+- Graph runs end-to-end (no voting yet); HITL deferred to M4.
+- Eval suite for `parse_preferences` and `score_candidates`.
+- **DoD**: a fixture mission with 5 members produces a ranked top-5 with pros/cons per place.
+
+### M4 — Voting + winner
+- Migrations for `votes`.
+- Nodes: `create_poll`, `collect_votes`, `select_winner`, `replan`.
+- Endpoints: `votes.py`, `agents.py` (incl. approve/reject).
+- HITL interrupt at `select_winner` and `replan`.
+- **DoD**: a fixture mission completes through to a winner+backup; rejecting at the HITL gate triggers `replan` and produces a new shortlist.
+
+### M5 — MCP server
+- `services/mcp_server/` scaffold using the official Python MCP SDK.
+- Tools, resources, prompts as defined in §9.
+- Stdio mode for local; SSE/HTTP mode for deploy.
+- **DoD**: `mcp-cli` (or Claude Desktop) can call `search_places`, `rank_candidates`, and read a mission resource.
+
+### M6 — Observability
+- OTel SDK wired into all services.
+- Prometheus exposition on `/metrics`.
+- Grafana dashboards committed and provisioned.
+- Alert rules + runbooks.
+- Sample incident doc.
+- **DoD**: a synthetic load run shows traces spanning api → agents → mcp; one alert fires and resolves cleanly.
+
+### M7 — Deploy
+- Docker images for each service.
+- Terraform for AWS (ECS Fargate, RDS, ElastiCache) **or** Render blueprint as the simpler path.
+- GitHub Actions deploy job, gated on tag.
+- DSR purge job.
+- **DoD**: production URL serves `/health=ok`; a real mission flow runs end-to-end against the deployed stack.
+
+### Mobile (parallel track)
+- M-Mobile-1: Expo app skeleton, auth screens, mission list.
+- M-Mobile-2: preferences form, mission detail, places list.
+- M-Mobile-3: voting UI, winner reveal.
+- M-Mobile-4: push notifications, deep links from invites.
+- Each gated on the corresponding backend milestone.
+
+---
+
+## 14. Local development
+
+### 14.1 Prerequisites
+
+- Python 3.12 (`pyenv` recommended)
+- Node 20 LTS + npm/pnpm (only when working on `apps/mobile`)
+- Docker Desktop (only from M2 onward)
+- An OpenAI API key and a Google Cloud project with Places API enabled (free tier for development)
+
+### 14.2 First-time setup
+
+```bash
+git clone git@github.com:atifabedeen/vibePulse.git
+cd vibePulse
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env       # then fill in real values locally
+pre-commit install         # after M0.5
+```
+
+### 14.3 Running services (M2+)
+
+```bash
+docker compose up -d postgres redis otel-collector prometheus grafana
+cd services/api && uvicorn app.main:app --reload
+cd services/agents && python -m vibebite_agents.graph        # serves graph
+cd services/mcp_server && python server.py                   # stdio
+cd services/worker && celery -A app worker -l info
+```
+
+### 14.4 Seed data
+
+`scripts/seed.py` (added in M1) creates: 3 users, 1 mission, 1 invite, 5 sample preferences, 10 cached places. Run with `python scripts/seed.py`.
+
+### 14.5 Mobile dev build vs Expo Go
+
+Google Maps SDK and Expo Notifications **require an Expo dev build** — they don't work in Expo Go. Use `eas build --profile development` to produce a dev client; install on device once, then `npx expo start --dev-client`.
+
+---
+
+## References
+
+[^role]: The role description emphasizes AI agents, autonomous workflows, automation, reliability engineering, telemetry, incident analysis, and remediation systems — VibeBite's architecture demonstrates each.
+[^places-overview]: Google Places API — establishment data and imagery for places.
+[^places-textsearch]: Google Places Text Search — query-based place lookup with optional location bias.
+[^places-details]: Google Places Place Details — full data for a known place ID.
+[^otel]: OpenTelemetry — vendor-neutral framework for traces, metrics, and logs.
+[^prom-alerting]: Prometheus alerting rules → Alertmanager (grouping, silencing, inhibition, notifications).
+[^expo]: Expo — production-grade React Native framework.
+[^eas]: EAS Build — produces App Store and Play Store binaries.
+[^fastapi]: FastAPI — modern Python web framework using type hints.
+[^pgvector]: pgvector — vector similarity search inside PostgreSQL.
+[^langgraph-persistence]: LangGraph persistence — durable execution via saved workflow state.
+[^langchain-hitl]: LangChain human-in-the-loop middleware — pauses execution for review of tool calls.
+[^mcp]: Model Context Protocol — servers expose resources, prompts, and tools to AI clients.
