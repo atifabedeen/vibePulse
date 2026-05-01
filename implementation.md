@@ -1,0 +1,843 @@
+# VibeBite Master Build Spec
+
+## 0. Project summary
+
+Build **VibeBite**, a production-ready mobile app that helps groups find the best food spot based on vibe, budget, dietary restrictions, distance, group preferences, and real-time constraints.
+
+The product should feel fun and social:
+
+> "We want a cheap late-night spot, not too loud, good for 5 people, with vegetarian options, and the vibe should be casual but still cute."
+
+The engineering should secretly demonstrate:
+
+- AI agents
+- autonomous workflows
+- AI-powered decision systems
+- monitoring and observability
+- incident-style remediation
+- Python automation
+- SQL
+- PostgreSQL
+- LangGraph
+- OpenAI API or Azure OpenAI
+- MCP
+- Prometheus
+- Grafana
+- OpenTelemetry
+- production-grade backend design
+
+This aligns with the target role because the role asks for AI agents, autonomous workflows, automation, reliability engineering, logs, metrics, incident analysis, and remediation systems.[^role]
+
+---
+
+## 1. Product name
+
+### Name
+
+VibeBite
+
+### Tagline
+
+Find the food spot your whole group can actually agree on.
+
+### Product one-liner
+
+VibeBite is a mobile AI agent app that collects group food preferences, searches nearby restaurants, ranks them by vibe and constraints, explains tradeoffs, runs a group vote, and replans when the group changes its mind.
+
+---
+
+## 2. Core user story
+
+A user opens the app and creates a food mission.
+
+Example:
+
+> Dinner tonight in Atlanta. 5 people. Under $25 each. Not too loud. One vegetarian. One person refuses sushi. We want somewhere casual but still a good vibe.
+
+The user invites friends.
+
+Each friend submits preferences:
+
+- budget
+- distance tolerance
+- cuisine likes
+- cuisine dislikes
+- dietary restrictions
+- vibe preference
+- noise tolerance
+- seating preference
+- urgency
+- "I am starving" level
+
+The AI agent system:
+
+1. Parses messy natural language into structured constraints.
+2. Searches restaurants using Google Places.
+3. Normalizes candidates.
+4. Scores restaurants against group preferences.
+5. Explains why each restaurant fits or does not fit.
+6. Creates a shortlist.
+7. Runs a group vote.
+8. Picks the best option and a backup.
+9. Replans if a constraint changes.
+10. Tracks failures, latency, API degradation, and agent decisions.
+
+Google Places API returns location data and imagery for establishments.[^places-overview] Text Search returns places from a query like "pizza in New York" and accepts a location bias.[^places-textsearch] Place Details returns address, phone, rating, and reviews for a known place ID.[^places-details]
+
+---
+
+## 3. What the finished product must do
+
+### MVP requirements
+
+The app must support:
+
+1. Account creation and login.
+2. Create a food mission.
+3. Invite friends to a mission through a shareable link.
+4. Friends can join without complex onboarding.
+5. Friends submit structured preferences and optional natural language comments.
+6. AI parses all preferences into a shared group constraint profile.
+7. App searches nearby places.
+8. App ranks top candidates.
+9. App shows top 5 restaurants with explanation cards.
+10. App supports group voting.
+11. App chooses a winner and one backup.
+12. App supports replanning when a friend changes constraints.
+13. App stores all agent runs, tool calls, scores, and decisions.
+14. App has observability dashboards.
+15. App has automated tests.
+16. App can run locally using Docker Compose.
+17. App can be deployed to a cloud environment.
+
+### Production-grade requirements
+
+The app must include:
+
+1. OpenTelemetry tracing.
+2. Prometheus metrics.
+3. Grafana dashboards.
+4. Structured logs.
+5. Retry logic for external APIs.
+6. Caching for Google Places results.
+7. Agent audit logs.
+8. Human approval for high-impact actions.
+9. MCP tool server.
+10. LangGraph workflows with persisted state.
+11. Error handling for invalid agent output.
+12. Rate-limit protection.
+13. CI/CD with GitHub Actions.
+14. Runbooks for common failures.
+15. Load tests.
+16. E2E mobile tests.
+17. Backend unit and integration tests.
+
+OpenTelemetry is a vendor-neutral framework for generating and exporting traces, metrics, and logs.[^otel] Prometheus alerting rules send alerts to Alertmanager, which handles grouping, silencing, inhibition, and notifications.[^prom-alerting]
+
+---
+
+## 4. Tech stack
+
+### Mobile app
+
+- React Native
+- Expo
+- TypeScript
+- Expo Router
+- NativeWind or Tamagui
+- Zustand for client state
+- TanStack Query for API state
+- React Hook Form
+- Zod
+- Expo Location
+- Expo Notifications
+- Google Maps SDK or React Native Maps
+- EAS Build
+
+Expo is a production-grade React Native framework, and EAS Build produces App Store and Play Store binaries.[^expo][^eas]
+
+### Backend
+
+- Python 3.12
+- FastAPI
+- Pydantic v2
+- SQLAlchemy 2.0
+- Alembic
+- PostgreSQL 16
+- pgvector
+- Redis 7
+- Celery or Dramatiq
+- LangGraph
+- OpenAI API or Azure OpenAI
+- MCP server
+- OpenTelemetry
+- Prometheus client
+- structlog
+- pytest
+
+FastAPI is a modern Python web framework using standard type hints.[^fastapi] pgvector enables vector similarity search inside Postgres.[^pgvector]
+
+### Agent framework
+
+- LangGraph for core multi-step workflows
+- OpenAI API for LLM calls
+- Pydantic schemas for structured outputs
+- MCP for exposing tools, resources, and prompts
+
+LangGraph's persistence layer supports durable execution: workflow state is saved so processes resume without repeating completed steps.[^langgraph-persistence] LangChain's human-in-the-loop middleware can pause execution when a tool call requires review.[^langchain-hitl] MCP servers expose resources, prompts, and tools to AI clients.[^mcp]
+
+### Infrastructure
+
+- Docker
+- Docker Compose
+- GitHub Actions
+- AWS ECS Fargate or Render for backend
+- AWS RDS PostgreSQL or Supabase Postgres
+- Upstash Redis or AWS ElastiCache
+- Grafana Cloud or self-hosted Grafana
+- Prometheus
+- OpenTelemetry Collector
+- Optional OpenSearch for logs
+
+### External APIs
+
+- Google Places API
+- Google Maps SDK
+- OpenAI API or Azure OpenAI
+- Optional Expo Push Notifications
+
+---
+
+## 5. Repository structure
+
+Monorepo at `vibebite/` (local working dir is `vibePulse/` for historical reasons; the canonical name is VibeBite).
+
+```text
+vibebite/
+  README.md
+  .gitignore
+  .env.example
+  .editorconfig
+  docker-compose.yml
+  Makefile
+  pyproject.toml              # shared ruff/black/mypy config
+  requirements-dev.txt        # shared dev tooling
+
+  apps/
+    mobile/                   # Expo React Native app
+      app/                    # Expo Router routes
+      src/
+        components/
+        screens/
+        hooks/
+        api/                  # generated from OpenAPI
+        state/                # Zustand stores
+        types/
+        utils/
+        theme/
+      assets/
+      package.json
+      app.json
+      eas.json
+      tsconfig.json
+
+    admin/                    # Next.js dashboard for ops/observability
+      src/
+        app/
+        components/
+        lib/
+        dashboards/
+      package.json
+      tsconfig.json
+
+  services/
+    api/                      # FastAPI public API
+      app/
+        main.py
+        config.py
+        database.py
+        dependencies.py
+        logging.py
+        telemetry.py
+
+        api/v1/
+          auth.py
+          users.py
+          missions.py
+          preferences.py
+          places.py
+          rankings.py
+          votes.py
+          agents.py
+          health.py
+
+        models/               # SQLAlchemy ORM
+          user.py mission.py preference.py place.py
+          ranking.py vote.py agent_run.py incident.py
+
+        schemas/              # Pydantic request/response
+          auth.py user.py mission.py preference.py
+          place.py ranking.py vote.py agent.py
+
+        services/             # business logic, reused by MCP server
+          auth_service.py
+          mission_service.py
+          places_service.py
+          ranking_service.py
+          notification_service.py
+          cache_service.py
+
+        repositories/         # SQLAlchemy data access
+          user_repo.py mission_repo.py places_repo.py
+          ranking_repo.py agent_repo.py
+
+        tests/
+          unit/
+          integration/
+
+      alembic/
+      pyproject.toml
+      Dockerfile
+
+    agents/                   # LangGraph workflows
+      vibebite_agents/
+        graph.py              # graph builder
+        state.py              # Pydantic state schema
+        prompts.py
+        models.py             # LLM client wrappers
+        tools.py              # internal tool wrappers
+        nodes/
+          parse_preferences.py
+          search_places.py
+          normalize_places.py
+          score_candidates.py
+          explain_candidates.py
+          create_poll.py
+          collect_votes.py
+          select_winner.py
+          replan.py
+          reliability_check.py
+        evals/
+          test_preference_parsing.py
+          test_ranking.py
+          test_replanning.py
+      pyproject.toml
+      Dockerfile
+
+    mcp_server/               # Model Context Protocol server
+      server.py
+      tools/
+        search_places.py
+        get_place_details.py
+        rank_candidates.py
+        create_poll.py
+        send_notification.py
+        inspect_failed_jobs.py
+        replan_mission.py
+      resources/
+        mission_resource.py
+        place_resource.py
+        agent_run_resource.py
+      prompts/
+        group_food_recommendation.py
+        restaurant_tradeoff_explanation.py
+        incident_summary.py
+      pyproject.toml
+      Dockerfile
+
+    worker/                   # Background job runner (Celery/Dramatiq)
+      app.py
+      jobs/
+        refresh_places_cache.py
+        retry_failed_agent_runs.py
+        send_push_notifications.py
+        compute_metrics.py
+      pyproject.toml
+      Dockerfile
+
+  infra/
+    prometheus/
+      prometheus.yml
+      alert_rules.yml
+    grafana/
+      dashboards/
+        api-dashboard.json
+        agent-dashboard.json
+        places-dashboard.json
+        mobile-dashboard.json
+    otel/
+      collector-config.yml
+    k8s/
+      api-deployment.yml agents-deployment.yml
+      worker-deployment.yml postgres.yml redis.yml
+    terraform/
+      main.tf variables.tf outputs.tf
+
+  docs/
+    architecture.md api.md database.md agents.md
+    mcp.md observability.md deployment.md testing.md
+    runbooks/
+      places-api-degraded.md
+      agent-output-invalid.md
+      ranking-confidence-low.md
+      push-notification-failed.md
+      database-latency-high.md
+    incidents/
+      sample-incident-places-api-degraded.md
+
+  tests/
+    load/
+      k6-missions.js
+      k6-ranking.js
+    e2e/
+      mobile-flow.md
+```
+
+### 5.1 File-by-file responsibilities
+
+**`apps/mobile/`** — Expo + React Native client. Owns: UI, client-side validation (Zod), API client (TanStack Query against the FastAPI OpenAPI spec), client state (Zustand), real-time poll updates (polling for v1, WebSocket optional later). Depends on: `services/api` OpenAPI schema (codegen at build time).
+
+**`apps/admin/`** — Next.js operator console. Read-only dashboards for agent runs, incidents, Places cache hit rate. Depends on: `services/api` admin endpoints and Grafana embed URLs.
+
+**`services/api/`** — FastAPI application. Owns: HTTP boundary, authentication (JWT), authorization, request validation, persistence (SQLAlchemy + Alembic), and `services/` (business logic that is **reused by `mcp_server` via direct import** — see §9). Exposes `/api/v1/*` and `/health`. Emits OTel spans, Prom metrics, and structlog JSON.
+
+**`services/agents/`** — LangGraph workflows. Owns: the graph definition, state schema, node implementations, evals. Calls `services/api` business logic via shared package import (in-process where possible) or HTTP for cross-service calls. Persists graph state via LangGraph's Postgres checkpointer (separate schema from app DB; see §6).
+
+**`services/mcp_server/`** — MCP server exposing tools/resources/prompts to external AI clients (Claude Desktop, Cursor, etc.). Imports `services/api/app/services/` directly to avoid logic duplication.
+
+**`services/worker/`** — Celery/Dramatiq worker for: Places cache refresh, retry of failed agent runs, push notification dispatch, metric rollups. Triggered by Redis broker; reads/writes the same Postgres as `services/api`.
+
+**`infra/prometheus/`** — Prometheus scrape config and alert rules consumed by Alertmanager.
+**`infra/grafana/`** — Dashboard JSON, version-controlled and provisioned via Grafana's file provisioner.
+**`infra/otel/`** — OTel Collector pipeline config (receivers → processors → exporters).
+**`infra/k8s/` / `infra/terraform/`** — production deploy manifests (M7).
+
+---
+
+## 6. Data model
+
+PostgreSQL 16 with the `pgvector` and `pgcrypto` extensions enabled. Alembic owns the **public** schema below. **LangGraph owns its own `langgraph` schema**, created by its checkpointer migrations — Alembic does not manage it. Two parallel migration tools is intentional and avoids accidental coupling.
+
+All timestamps are `timestamptz`. All primary keys are `uuid` defaulting to `gen_random_uuid()` from `pgcrypto`. Soft-delete is intentionally **not** used; deletion is hard-delete with audit rows in `agent_runs`/`incidents` where relevant.
+
+### 6.1 DDL
+
+```sql
+-- Extensions
+create extension if not exists pgcrypto;
+create extension if not exists vector;
+
+-- users: account holders
+create table users (
+  id              uuid primary key default gen_random_uuid(),
+  email           citext unique not null,
+  password_hash   text not null,
+  display_name    text not null,
+  avatar_url      text,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+  deleted_at      timestamptz  -- only set during GDPR-style erasure
+);
+create index users_email_idx on users (email);
+
+-- missions: a single group decision
+create table missions (
+  id              uuid primary key default gen_random_uuid(),
+  creator_id      uuid not null references users(id) on delete restrict,
+  title           text not null,
+  description     text,
+  status          text not null check (status in
+                  ('draft','collecting','ranking','voting','decided','cancelled')),
+  location_lat    double precision not null,
+  location_lng    double precision not null,
+  search_radius_m integer not null default 3000,
+  scheduled_for   timestamptz,
+  winner_place_id uuid references places(id),
+  backup_place_id uuid references places(id),
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+create index missions_creator_idx on missions (creator_id);
+create index missions_status_idx on missions (status);
+
+-- mission_members: who is in the mission
+create table mission_members (
+  mission_id      uuid not null references missions(id) on delete cascade,
+  user_id         uuid not null references users(id) on delete cascade,
+  role            text not null check (role in ('owner','member')),
+  joined_at       timestamptz not null default now(),
+  primary key (mission_id, user_id)
+);
+
+-- mission_invites: shareable-link invites (MVP req #3)
+-- Each invite has a token; redeeming creates a mission_members row.
+create table mission_invites (
+  id              uuid primary key default gen_random_uuid(),
+  mission_id      uuid not null references missions(id) on delete cascade,
+  token           text unique not null,                -- random url-safe
+  expires_at      timestamptz not null,
+  max_uses        integer not null default 10,
+  uses            integer not null default 0,
+  created_at      timestamptz not null default now()
+);
+create index mission_invites_mission_idx on mission_invites (mission_id);
+
+-- preferences: one row per (mission, user); edited as constraints change
+create table preferences (
+  mission_id              uuid not null references missions(id) on delete cascade,
+  user_id                 uuid not null references users(id) on delete cascade,
+  budget_max_cents        integer,
+  distance_tolerance_m    integer,
+  cuisines_like           text[] not null default '{}',
+  cuisines_dislike        text[] not null default '{}',
+  dietary_restrictions    text[] not null default '{}',
+  vibe                    text,                           -- free text
+  noise_tolerance         smallint check (noise_tolerance between 0 and 5),
+  seating_preference      text,                           -- 'indoor','outdoor','either'
+  urgency                 smallint check (urgency between 0 and 5),
+  hunger_level            smallint check (hunger_level between 0 and 5),
+  raw_comment             text,                           -- natural-language input
+  parsed_at               timestamptz,                    -- when AI parsed raw_comment
+  updated_at              timestamptz not null default now(),
+  primary key (mission_id, user_id)
+);
+
+-- places: cached Google Places + embeddings for vibe similarity
+create table places (
+  id              uuid primary key default gen_random_uuid(),
+  google_place_id text unique not null,
+  name            text not null,
+  address         text,
+  lat             double precision not null,
+  lng             double precision not null,
+  price_level     smallint check (price_level between 0 and 4),
+  rating          numeric(2,1),
+  user_rating_ct  integer,
+  cuisines        text[] not null default '{}',
+  raw_blob        jsonb not null,                         -- full Places payload
+  vibe_embedding  vector(1536),                           -- OpenAI text-embedding-3-small
+  fetched_at      timestamptz not null default now(),
+  expires_at      timestamptz not null,                   -- TTL: 7 days
+  created_at      timestamptz not null default now()
+);
+create index places_google_id_idx on places (google_place_id);
+create index places_expires_idx   on places (expires_at);
+create index places_vibe_ivfflat_idx on places using ivfflat (vibe_embedding vector_cosine_ops);
+
+-- rankings: one row per (mission, place) per ranking run
+create table rankings (
+  id              uuid primary key default gen_random_uuid(),
+  mission_id      uuid not null references missions(id) on delete cascade,
+  place_id        uuid not null references places(id),
+  agent_run_id    uuid not null references agent_runs(id),
+  rank            integer not null,
+  score           numeric(5,2) not null,                  -- 0.00 - 100.00
+  reasons         jsonb not null,                         -- {pros:[],cons:[]}
+  created_at      timestamptz not null default now()
+);
+create index rankings_mission_run_idx on rankings (mission_id, agent_run_id);
+
+-- votes: one row per (mission, user, place) — supports approval voting
+create table votes (
+  mission_id      uuid not null references missions(id) on delete cascade,
+  user_id         uuid not null references users(id) on delete cascade,
+  place_id        uuid not null references places(id),
+  weight          smallint not null default 1,            -- 1=upvote, -1=veto
+  created_at      timestamptz not null default now(),
+  primary key (mission_id, user_id, place_id)
+);
+
+-- agent_runs: top-level LangGraph executions
+create table agent_runs (
+  id              uuid primary key default gen_random_uuid(),
+  mission_id      uuid not null references missions(id) on delete cascade,
+  graph_name      text not null,                          -- 'recommend_v1','replan_v1'
+  status          text not null check (status in
+                  ('running','succeeded','failed','interrupted','cancelled')),
+  trigger         text not null,                          -- 'user','cron','webhook'
+  input           jsonb not null,
+  output          jsonb,
+  error           text,
+  started_at      timestamptz not null default now(),
+  finished_at     timestamptz,
+  total_tokens    integer,
+  total_cost_usd  numeric(10,6)
+);
+create index agent_runs_mission_idx on agent_runs (mission_id, started_at desc);
+create index agent_runs_status_idx  on agent_runs (status);
+
+-- agent_run_steps: one row per LangGraph node execution
+create table agent_run_steps (
+  id              uuid primary key default gen_random_uuid(),
+  agent_run_id    uuid not null references agent_runs(id) on delete cascade,
+  node_name       text not null,
+  status          text not null,
+  input           jsonb,
+  output          jsonb,
+  tool_calls      jsonb,                                  -- list of {name,args,result}
+  error           text,
+  latency_ms      integer,
+  started_at      timestamptz not null,
+  finished_at     timestamptz
+);
+create index agent_run_steps_run_idx on agent_run_steps (agent_run_id, started_at);
+
+-- incidents: detected reliability issues (Places degraded, agent loops, etc.)
+create table incidents (
+  id              uuid primary key default gen_random_uuid(),
+  kind            text not null,                          -- e.g. 'places_api_degraded'
+  severity        text not null check (severity in ('info','warn','error','critical')),
+  status          text not null check (status in ('open','acknowledged','resolved')),
+  title           text not null,
+  details         jsonb not null,
+  related_run_id  uuid references agent_runs(id),
+  opened_at       timestamptz not null default now(),
+  resolved_at     timestamptz
+);
+create index incidents_status_idx on incidents (status, opened_at desc);
+```
+
+### 6.2 Retention
+
+| Table | Retention | Trigger |
+|---|---|---|
+| `users` | indefinite, until erasure request | DSR endpoint sets `deleted_at` and scrubs PII |
+| `missions` | 90 days after `decided`/`cancelled` | nightly worker job |
+| `preferences` | tied to mission | cascade |
+| `places` | TTL `expires_at` (7 days) | worker `refresh_places_cache.py` |
+| `agent_runs` / `agent_run_steps` | 30 days | nightly worker job |
+| `incidents` | 365 days | manual archive |
+
+### 6.3 LangGraph checkpointer
+
+LangGraph's Postgres checkpointer manages a separate `langgraph` schema with its own tables (`checkpoints`, `checkpoint_writes`, `checkpoint_blobs`). This is created by `langgraph.checkpoint.postgres.PostgresSaver.setup()` on first run, **not** by Alembic. The `agent_runs` table above is our app-level audit log; the `langgraph` schema is the workflow engine's state. They are intentionally separate.
+
+---
+
+## 7. REST API
+
+Base URL: `/api/v1`. JSON only. Auth: Bearer JWT in `Authorization` header unless noted. All errors follow RFC 7807 problem+json: `{type, title, status, detail, instance}`. Standard error codes: `400` validation, `401` unauthenticated, `403` unauthorized, `404` not found, `409` conflict, `429` rate limited, `500` server error, `503` upstream degraded.
+
+### 7.1 `auth.py` — `/api/v1/auth`
+
+| Method | Path | Auth | Request | Response | Errors |
+|---|---|---|---|---|---|
+| POST | `/register` | none | `{email, password, display_name}` | `201 {user, access_token, refresh_token}` | 400, 409 |
+| POST | `/login` | none | `{email, password}` | `200 {user, access_token, refresh_token}` | 400, 401 |
+| POST | `/refresh` | refresh token | `{refresh_token}` | `200 {access_token}` | 401 |
+| POST | `/logout` | yes | — | `204` | — |
+| GET  | `/me` | yes | — | `200 User` | 401 |
+
+### 7.2 `users.py` — `/api/v1/users`
+
+| Method | Path | Auth | Request | Response |
+|---|---|---|---|---|
+| PATCH | `/me` | yes | `{display_name?, avatar_url?}` | `200 User` |
+| DELETE | `/me` | yes | — | `204` (DSR — scrubs PII, soft-deletes) |
+
+### 7.3 `missions.py` — `/api/v1/missions`
+
+| Method | Path | Auth | Request | Response |
+|---|---|---|---|---|
+| POST | `/` | yes | `MissionCreate` | `201 Mission` |
+| GET | `/` | yes | `?status=&limit=&cursor=` | `200 {items: Mission[], next_cursor}` |
+| GET | `/{id}` | yes (member) | — | `200 MissionDetail` |
+| PATCH | `/{id}` | yes (owner) | `MissionUpdate` | `200 Mission` |
+| DELETE | `/{id}` | yes (owner) | — | `204` |
+| POST | `/{id}/invites` | yes (owner) | `{expires_in_hours, max_uses}` | `201 Invite` |
+| POST | `/invites/redeem` | yes | `{token}` | `200 Mission` |
+| POST | `/{id}/replan` | yes (member) | `{reason}` | `202 {agent_run_id}` |
+
+`MissionCreate`:
+```json
+{ "title": "string", "description": "string?",
+  "location": {"lat": 0, "lng": 0}, "search_radius_m": 3000,
+  "scheduled_for": "ISO-8601?" }
+```
+
+### 7.4 `preferences.py` — `/api/v1/missions/{mission_id}/preferences`
+
+| Method | Path | Auth | Request | Response |
+|---|---|---|---|---|
+| PUT | `/me` | yes (member) | `PreferencePayload` | `200 Preference` |
+| GET | `/` | yes (member) | — | `200 Preference[]` |
+| POST | `/me/parse` | yes (member) | `{raw_comment}` | `200 Preference` (AI-parsed) |
+
+`PreferencePayload` mirrors the `preferences` table columns.
+
+### 7.5 `places.py` — `/api/v1/missions/{mission_id}/places`
+
+| Method | Path | Auth | Response |
+|---|---|---|---|
+| GET | `/` | yes (member) | `200 Place[]` (cached candidates for this mission) |
+| GET | `/{place_id}` | yes (member) | `200 PlaceDetail` |
+| POST | `/refresh` | yes (owner) | `202 {agent_run_id}` (force re-search) |
+
+### 7.6 `rankings.py` — `/api/v1/missions/{mission_id}/rankings`
+
+| Method | Path | Auth | Response |
+|---|---|---|---|
+| GET | `/latest` | yes (member) | `200 {agent_run_id, items: Ranking[]}` |
+| GET | `/runs/{agent_run_id}` | yes (member) | `200 {items: Ranking[]}` |
+
+### 7.7 `votes.py` — `/api/v1/missions/{mission_id}/votes`
+
+| Method | Path | Auth | Request | Response |
+|---|---|---|---|---|
+| PUT | `/me` | yes (member) | `{place_id, weight}` (weight ∈ {-1, 1}) | `200 Vote[]` |
+| GET | `/` | yes (member) | — | `200 {tally: {place_id: {up, veto}}}` |
+| POST | `/finalize` | yes (owner) | — | `200 {winner: Place, backup: Place}` |
+
+### 7.8 `agents.py` — `/api/v1/missions/{mission_id}/agents`
+
+| Method | Path | Auth | Response |
+|---|---|---|---|
+| GET | `/runs` | yes (member) | `200 AgentRun[]` |
+| GET | `/runs/{run_id}` | yes (member) | `200 AgentRunDetail` (includes steps) |
+| POST | `/runs/{run_id}/approve` | yes (owner) | `200` (resumes interrupted graph; see §8) |
+| POST | `/runs/{run_id}/reject` | yes (owner) | `200` |
+
+### 7.9 `health.py` — `/health`, `/ready`, `/metrics`
+
+- `GET /health` → `200 {status:"ok"}` always (liveness).
+- `GET /ready` → `200` if DB+Redis reachable, else `503`.
+- `GET /metrics` → Prometheus exposition format. No auth (cluster-internal only).
+
+### 7.10 Inbound callbacks
+
+There are **no third-party webhooks** in v1. Google Places does not push. Expo Push delivery receipts are **polled** by `services/worker/jobs/send_push_notifications.py`, not pushed. If we add Stripe or similar later, callbacks will live under `/api/v1/webhooks/{provider}` with signature verification middleware — pinning the URL shape now so future additions don't reshape v1.
+
+---
+
+## 8. LangGraph workflow
+
+The agent system is a single graph, `recommend_v1`, defined in `services/agents/vibebite_agents/graph.py`. A second graph `replan_v1` reuses most nodes but starts at `parse_preferences` with the new constraints injected.
+
+### 8.1 State schema (`state.py`)
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+from uuid import UUID
+
+class MemberPref(BaseModel):
+    user_id: UUID
+    structured: dict          # snapshot of preferences row
+    raw_comment: str | None
+
+class CandidatePlace(BaseModel):
+    place_id: UUID
+    google_place_id: str
+    name: str
+    score: float | None = None
+    pros: list[str] = Field(default_factory=list)
+    cons: list[str] = Field(default_factory=list)
+
+class GraphState(BaseModel):
+    # inputs
+    mission_id: UUID
+    member_prefs: list[MemberPref]
+    location: tuple[float, float]
+    search_radius_m: int
+
+    # derived
+    group_constraints: dict | None = None     # parse_preferences output
+    candidates: list[CandidatePlace] = Field(default_factory=list)
+    shortlist: list[CandidatePlace] = Field(default_factory=list)
+
+    # voting
+    poll_id: UUID | None = None
+    votes: dict[str, dict] = Field(default_factory=dict)
+
+    # decision
+    winner: CandidatePlace | None = None
+    backup: CandidatePlace | None = None
+
+    # control
+    needs_human_approval: bool = False
+    approval_decision: Literal["approve", "reject"] | None = None
+
+    # observability
+    agent_run_id: UUID
+```
+
+### 8.2 Nodes
+
+| Node | Input (state fields read) | Output (state fields written) | Side effects |
+|---|---|---|---|
+| `parse_preferences` | `member_prefs` | `group_constraints` | OpenAI call w/ structured output (Pydantic); writes parsed result to `preferences.parsed_at` |
+| `search_places` | `group_constraints`, `location`, `search_radius_m` | `candidates` (raw) | Google Places Text Search; upserts into `places` table; emits `places_api_calls_total` |
+| `normalize_places` | `candidates` | `candidates` (filtered) | Drops candidates with insufficient data; tags missing fields |
+| `score_candidates` | `candidates`, `group_constraints` | `candidates` (with score) | Deterministic scoring fn (no LLM); writes `rankings` rows |
+| `explain_candidates` | `candidates` (top 5) | `shortlist` (with pros/cons) | OpenAI call per candidate; writes `rankings.reasons` |
+| `create_poll` | `shortlist` | `poll_id` | Creates a poll row (votes scoped to mission) |
+| `collect_votes` | `poll_id` | `votes` | **Polls votes** until quorum or timeout (LangGraph interrupt / `wait_for_event`) |
+| `select_winner` | `votes`, `shortlist` | `winner`, `backup`, `needs_human_approval=true` | **HITL interrupt** — graph pauses; resumed by `POST /agents/runs/{id}/approve` |
+| `replan` | new constraint trigger | `group_constraints` (updated) | Branches back to `search_places` if location changed, else `score_candidates` |
+| `reliability_check` | `state` (always-on tap) | — | Detects API degradation, low-confidence rankings; writes `incidents` |
+
+### 8.3 Edges
+
+```text
+START → parse_preferences → search_places → normalize_places →
+  score_candidates → explain_candidates → create_poll →
+  collect_votes → select_winner → [HITL interrupt] →
+  (if approved) END
+  (if rejected) → replan → score_candidates → ...
+
+reliability_check is a parallel node attached after every external-API node
+(search_places, explain_candidates) and writes incidents without blocking the path.
+```
+
+### 8.4 Checkpointer & HITL
+
+- Checkpointer: `langgraph.checkpoint.postgres.PostgresSaver`, schema `langgraph` (see §6.3).
+- Interrupt points (explicit): **`select_winner`** (group/owner must confirm winner) and **`replan`** (owner must confirm constraint change is intentional, not a misclick). All other nodes run autonomously.
+- Resumption: API endpoint `POST /agents/runs/{id}/approve|reject` calls `graph.update_state(...)` then `graph.invoke(None, config)` to continue.
+- Timeouts: `collect_votes` has a 30-minute soft timeout; if quorum not reached, proceeds with partial votes and writes an `incidents` row (`severity=warn`).
+
+### 8.5 Error handling
+
+- Any node raising → `agent_runs.status='failed'`, `error` populated, `incidents` row written.
+- Invalid LLM output (Pydantic validation fail) → one retry with stricter prompt; second failure → `failed`.
+- External API 429/5xx → exponential backoff (1s, 4s, 16s) up to 3 attempts; persistent failure → `incidents` row, `severity=error`.
+
+---
+
+## 9. MCP server
+
+`services/mcp_server/server.py` runs the official Python MCP SDK in stdio mode (local) and SSE/HTTP mode (deployed). It exposes **tools**, **resources**, and **prompts**.
+
+**Architecture decision:** MCP tool implementations **import `services/api/app/services/` directly** — they do not call the FastAPI HTTP API. This avoids logic duplication between `mcp_server/tools/search_places.py` and `services/api/app/services/places_service.py`. Both services are deployed as separate containers but share the `services/api/app/services/` Python package via a workspace dependency.
+
+### 9.1 Tools
+
+Each tool has: name, JSON input schema, JSON output schema, side effects.
+
+| Name | Input | Output | Side effects |
+|---|---|---|---|
+| `search_places` | `{query, lat, lng, radius_m, max_results?}` | `{places: Place[]}` | Hits Google Places (cached); upserts `places` |
+| `get_place_details` | `{google_place_id}` | `Place` | Hits Place Details (cached) |
+| `rank_candidates` | `{mission_id, place_ids[], constraints}` | `{rankings: Ranking[]}` | Writes `rankings` rows |
+| `create_poll` | `{mission_id, place_ids[]}` | `{poll_id}` | Creates poll |
+| `send_notification` | `{user_ids[], title, body, data?}` | `{message_ids[]}` | Calls Expo Push; queues delivery-receipt poll |
+| `inspect_failed_jobs` | `{since?, limit?}` | `{runs: AgentRunSummary[]}` | none (read-only) |
+| `replan_mission` | `{mission_id, reason}` | `{agent_run_id}` | Triggers `replan_v1` graph |
+
+### 9.2 Resources
+
+| URI pattern | Returns |
+|---|---|
+| `vibebite://missions/{id}` | Full mission JSON (mission + members + latest ranking + winner) |
+| `vibebite://places/{id}` | Place JSON + cached Google blob |
+| `vibebite://agent-runs/{id}` | Agent run + all steps |
+
+### 9.3 Prompts
+
+| Name | Purpose | Variables |
+|---|---|---|
+| `group_food_recommendation` | Used by `parse_preferences` and `explain_candidates` | `member_prefs`, `location` |
+| `restaurant_tradeoff_explanation` | Used by `explain_candidates` per place | `place`, `group_constraints` |
+| `incident_summary` | Used by `reliability_check` to write incident `details` | `signals`, `recent_runs` |
+
+[§10–§14 added in Phase A2]
