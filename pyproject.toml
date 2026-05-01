@@ -1,0 +1,59 @@
+# Root pyproject.toml: shared tool config only.
+# Each services/<name>/ has its own pyproject.toml that declares
+# runtime deps and inherits these tool sections.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".venv", "alembic/versions", "**/migrations/**"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle / pyflakes
+  "I",             # isort
+  "B",             # bugbear
+  "UP",            # pyupgrade
+  "N",             # pep8-naming
+  "ASYNC",         # async pitfalls
+  "S",             # bandit (security)
+  "RUF",           # ruff-specific
+]
+ignore = [
+  "E501",   # line length handled by black
+  "S101",   # asserts ok in tests
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S", "N802", "N803"]
+"**/evals/**" = ["S"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+extend-exclude = '''
+/(
+    \.venv
+  | alembic/versions
+  | .*/migrations
+)/
+'''
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+exclude = ['\.venv', 'alembic/versions', '.*/migrations']
+
+# Per-service overrides (loosen where vendor types are missing) live
+# in each services/<name>/pyproject.toml under [tool.mypy.overrides].
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+testpaths = ["services"]
+markers = [
+  "integration: requires live Postgres/Redis (testcontainers)",
+  "eval: LangGraph node/graph evaluation tests",
+  "slow: takes more than 5 seconds",
+]
