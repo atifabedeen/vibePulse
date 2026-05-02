@@ -4,6 +4,10 @@ Revision ID: 0001
 Revises:
 Create Date: 2025-01-01 00:00:00.000000
 
+Dual-dialect: works on both Postgres (with pgvector) and SQLite. The migration
+branches on ``op.get_context().dialect.name`` for Postgres-only features
+(extensions, pgvector column type, ivfflat index). Everywhere else we lean on
+SQLAlchemy's portable types so the same DDL emits sensible SQL on either side.
 """
 from __future__ import annotations
 
@@ -20,172 +24,239 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _is_postgres() -> bool:
+    return op.get_context().dialect.name == "postgresql"
+
+
 def upgrade() -> None:
-    # ----- Extensions -----
-    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
-    op.execute("CREATE EXTENSION IF NOT EXISTS citext")
-    op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    is_pg = _is_postgres()
+
+    # ----- Extensions (Postgres only) -----
+    if is_pg:
+        op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        op.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    # Choose the embedding column type per dialect.
+    if is_pg:
+        # Local import so SQLite environments don't need pgvector installed
+        # at migration time (it's still in deps, but this keeps the module
+        # importable cleanly in either world).
+        from pgvector.sqlalchemy import Vector  # type: ignore[import-not-found]
+
+        embedding_col_type: sa.types.TypeEngine = Vector(1536)
+    else:
+        embedding_col_type = sa.JSON()
 
     # ----- users -----
-    op.execute(
-        """
-        CREATE TABLE users (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            email           citext UNIQUE NOT NULL,
-            password_hash   text NOT NULL,
-            display_name    text NOT NULL,
-            avatar_url      text,
-            created_at      timestamptz NOT NULL DEFAULT now(),
-            updated_at      timestamptz NOT NULL DEFAULT now(),
-            deleted_at      timestamptz
-        )
-        """
+    op.create_table(
+        "users",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("email", sa.String(320), nullable=False),
+        sa.Column("password_hash", sa.Text(), nullable=False),
+        sa.Column("display_name", sa.Text(), nullable=False),
+        sa.Column("avatar_url", sa.Text(), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("deleted_at", sa.DateTime(timezone=True), nullable=True),
+        sa.UniqueConstraint("email", name="users_email_key"),
     )
     op.create_index("users_email_idx", "users", ["email"])
 
     # ----- missions -----
-    # Note: places(id) is created below; we add the FKs (winner_place_id,
-    # backup_place_id) AFTER the `places` table exists.
-    op.execute(
-        """
-        CREATE TABLE missions (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            creator_id      uuid NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-            title           text NOT NULL,
-            description     text,
-            status          text NOT NULL CHECK (status IN
-                            ('draft','collecting','ranking','voting','decided','cancelled')),
-            location_lat    double precision NOT NULL,
-            location_lng    double precision NOT NULL,
-            search_radius_m integer NOT NULL DEFAULT 3000,
-            scheduled_for   timestamptz,
-            winner_place_id uuid,
-            backup_place_id uuid,
-            created_at      timestamptz NOT NULL DEFAULT now(),
-            updated_at      timestamptz NOT NULL DEFAULT now()
-        )
-        """
+    # NB: places(id) is created below; the FKs (winner_place_id, backup_place_id)
+    # are added AFTER the `places` table exists.
+    op.create_table(
+        "missions",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column(
+            "creator_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="RESTRICT"),
+            nullable=False,
+        ),
+        sa.Column("title", sa.Text(), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("location_lat", sa.Float(), nullable=False),
+        sa.Column("location_lng", sa.Float(), nullable=False),
+        sa.Column(
+            "search_radius_m",
+            sa.Integer(),
+            nullable=False,
+            server_default=sa.text("3000"),
+        ),
+        sa.Column("scheduled_for", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("winner_place_id", sa.String(36), nullable=True),
+        sa.Column("backup_place_id", sa.String(36), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "status IN ('draft','collecting','ranking','voting','decided','cancelled')",
+            name="missions_status_check",
+        ),
     )
     op.create_index("missions_creator_idx", "missions", ["creator_id"])
     op.create_index("missions_status_idx", "missions", ["status"])
 
     # ----- mission_members -----
-    op.execute(
-        """
-        CREATE TABLE mission_members (
-            mission_id      uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            user_id         uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            role            text NOT NULL CHECK (role IN ('owner','member')),
-            joined_at       timestamptz NOT NULL DEFAULT now(),
-            PRIMARY KEY (mission_id, user_id)
-        )
-        """
+    op.create_table(
+        "mission_members",
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "user_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column("role", sa.Text(), nullable=False),
+        sa.Column("joined_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "role IN ('owner','member')", name="mission_members_role_check"
+        ),
     )
 
     # ----- mission_invites -----
-    op.execute(
-        """
-        CREATE TABLE mission_invites (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            mission_id      uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            token           text UNIQUE NOT NULL,
-            expires_at      timestamptz NOT NULL,
-            max_uses        integer NOT NULL DEFAULT 10,
-            uses            integer NOT NULL DEFAULT 0,
-            created_at      timestamptz NOT NULL DEFAULT now()
-        )
-        """
+    op.create_table(
+        "mission_invites",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("token", sa.Text(), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column(
+            "max_uses", sa.Integer(), nullable=False, server_default=sa.text("10")
+        ),
+        sa.Column("uses", sa.Integer(), nullable=False, server_default=sa.text("0")),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.UniqueConstraint("token", name="mission_invites_token_key"),
     )
     op.create_index("mission_invites_mission_idx", "mission_invites", ["mission_id"])
 
     # ----- preferences -----
-    op.execute(
-        """
-        CREATE TABLE preferences (
-            mission_id              uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            user_id                 uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            budget_max_cents        integer,
-            distance_tolerance_m    integer,
-            cuisines_like           text[] NOT NULL DEFAULT '{}',
-            cuisines_dislike        text[] NOT NULL DEFAULT '{}',
-            dietary_restrictions    text[] NOT NULL DEFAULT '{}',
-            vibe                    text,
-            noise_tolerance         smallint CHECK (noise_tolerance BETWEEN 0 AND 5),
-            seating_preference      text,
-            urgency                 smallint CHECK (urgency BETWEEN 0 AND 5),
-            hunger_level            smallint CHECK (hunger_level BETWEEN 0 AND 5),
-            raw_comment             text,
-            parsed_at               timestamptz,
-            updated_at              timestamptz NOT NULL DEFAULT now(),
-            PRIMARY KEY (mission_id, user_id)
-        )
-        """
+    op.create_table(
+        "preferences",
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "user_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column("budget_max_cents", sa.Integer(), nullable=True),
+        sa.Column("distance_tolerance_m", sa.Integer(), nullable=True),
+        sa.Column("cuisines_like", sa.JSON(), nullable=False),
+        sa.Column("cuisines_dislike", sa.JSON(), nullable=False),
+        sa.Column("dietary_restrictions", sa.JSON(), nullable=False),
+        sa.Column("vibe", sa.Text(), nullable=True),
+        sa.Column("noise_tolerance", sa.SmallInteger(), nullable=True),
+        sa.Column("seating_preference", sa.Text(), nullable=True),
+        sa.Column("urgency", sa.SmallInteger(), nullable=True),
+        sa.Column("hunger_level", sa.SmallInteger(), nullable=True),
+        sa.Column("raw_comment", sa.Text(), nullable=True),
+        sa.Column("parsed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "noise_tolerance BETWEEN 0 AND 5",
+            name="preferences_noise_tolerance_check",
+        ),
+        sa.CheckConstraint(
+            "urgency BETWEEN 0 AND 5", name="preferences_urgency_check"
+        ),
+        sa.CheckConstraint(
+            "hunger_level BETWEEN 0 AND 5", name="preferences_hunger_level_check"
+        ),
     )
 
     # ----- places -----
-    op.execute(
-        """
-        CREATE TABLE places (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            google_place_id text UNIQUE NOT NULL,
-            name            text NOT NULL,
-            address         text,
-            lat             double precision NOT NULL,
-            lng             double precision NOT NULL,
-            price_level     smallint CHECK (price_level BETWEEN 0 AND 4),
-            rating          numeric(2,1),
-            user_rating_ct  integer,
-            cuisines        text[] NOT NULL DEFAULT '{}',
-            raw_blob        jsonb NOT NULL,
-            vibe_embedding  vector(1536),
-            fetched_at      timestamptz NOT NULL DEFAULT now(),
-            expires_at      timestamptz NOT NULL,
-            created_at      timestamptz NOT NULL DEFAULT now()
-        )
-        """
+    op.create_table(
+        "places",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("google_place_id", sa.Text(), nullable=False),
+        sa.Column("name", sa.Text(), nullable=False),
+        sa.Column("address", sa.Text(), nullable=True),
+        sa.Column("lat", sa.Float(), nullable=False),
+        sa.Column("lng", sa.Float(), nullable=False),
+        sa.Column("price_level", sa.SmallInteger(), nullable=True),
+        sa.Column("rating", sa.Numeric(2, 1), nullable=True),
+        sa.Column("user_rating_ct", sa.Integer(), nullable=True),
+        sa.Column("cuisines", sa.JSON(), nullable=False),
+        sa.Column("raw_blob", sa.JSON(), nullable=False),
+        sa.Column("vibe_embedding", embedding_col_type, nullable=True),
+        sa.Column("fetched_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
+        sa.CheckConstraint(
+            "price_level BETWEEN 0 AND 4", name="places_price_level_check"
+        ),
+        sa.UniqueConstraint("google_place_id", name="places_google_place_id_key"),
     )
     op.create_index("places_google_id_idx", "places", ["google_place_id"])
     op.create_index("places_expires_idx", "places", ["expires_at"])
-    op.execute(
-        "CREATE INDEX places_vibe_ivfflat_idx ON places "
-        "USING ivfflat (vibe_embedding vector_cosine_ops)"
-    )
+    if is_pg:
+        # ivfflat index — Postgres + pgvector only.
+        op.execute(
+            "CREATE INDEX places_vibe_ivfflat_idx ON places "
+            "USING ivfflat (vibe_embedding vector_cosine_ops)"
+        )
 
     # Now wire missions -> places FKs.
-    op.create_foreign_key(
-        "missions_winner_place_id_fkey",
-        "missions",
-        "places",
-        ["winner_place_id"],
-        ["id"],
-    )
-    op.create_foreign_key(
-        "missions_backup_place_id_fkey",
-        "missions",
-        "places",
-        ["backup_place_id"],
-        ["id"],
-    )
+    # SQLite cannot ALTER a table to add a foreign key after creation, so we
+    # only emit these on Postgres. The corresponding ORM-level FK declarations
+    # still apply for cascade/relationship semantics.
+    if is_pg:
+        op.create_foreign_key(
+            "missions_winner_place_id_fkey",
+            "missions",
+            "places",
+            ["winner_place_id"],
+            ["id"],
+        )
+        op.create_foreign_key(
+            "missions_backup_place_id_fkey",
+            "missions",
+            "places",
+            ["backup_place_id"],
+            ["id"],
+        )
 
     # ----- agent_runs (must exist before rankings, which references it) -----
-    op.execute(
-        """
-        CREATE TABLE agent_runs (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            mission_id      uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            graph_name      text NOT NULL,
-            status          text NOT NULL CHECK (status IN
-                            ('running','succeeded','failed','interrupted','cancelled')),
-            trigger         text NOT NULL,
-            input           jsonb NOT NULL,
-            output          jsonb,
-            error           text,
-            started_at      timestamptz NOT NULL DEFAULT now(),
-            finished_at     timestamptz,
-            total_tokens    integer,
-            total_cost_usd  numeric(10,6)
-        )
-        """
+    op.create_table(
+        "agent_runs",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("graph_name", sa.Text(), nullable=False),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("trigger", sa.Text(), nullable=False),
+        sa.Column("input", sa.JSON(), nullable=False),
+        sa.Column("output", sa.JSON(), nullable=True),
+        sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("total_tokens", sa.Integer(), nullable=True),
+        sa.Column("total_cost_usd", sa.Numeric(10, 6), nullable=True),
+        sa.CheckConstraint(
+            "status IN ('running','succeeded','failed','interrupted','cancelled')",
+            name="agent_runs_status_check",
+        ),
     )
     op.create_index(
         "agent_runs_mission_idx",
@@ -195,53 +266,82 @@ def upgrade() -> None:
     op.create_index("agent_runs_status_idx", "agent_runs", ["status"])
 
     # ----- rankings -----
-    op.execute(
-        """
-        CREATE TABLE rankings (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            mission_id      uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            place_id        uuid NOT NULL REFERENCES places(id),
-            agent_run_id    uuid NOT NULL REFERENCES agent_runs(id),
-            rank            integer NOT NULL,
-            score           numeric(5,2) NOT NULL,
-            reasons         jsonb NOT NULL,
-            created_at      timestamptz NOT NULL DEFAULT now()
-        )
-        """
+    op.create_table(
+        "rankings",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column(
+            "place_id",
+            sa.String(36),
+            sa.ForeignKey("places.id"),
+            nullable=False,
+        ),
+        sa.Column(
+            "agent_run_id",
+            sa.String(36),
+            sa.ForeignKey("agent_runs.id"),
+            nullable=False,
+        ),
+        sa.Column("rank", sa.Integer(), nullable=False),
+        sa.Column("score", sa.Numeric(5, 2), nullable=False),
+        sa.Column("reasons", sa.JSON(), nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index("rankings_mission_run_idx", "rankings", ["mission_id", "agent_run_id"])
+    op.create_index(
+        "rankings_mission_run_idx", "rankings", ["mission_id", "agent_run_id"]
+    )
 
     # ----- votes -----
-    op.execute(
-        """
-        CREATE TABLE votes (
-            mission_id      uuid NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
-            user_id         uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            place_id        uuid NOT NULL REFERENCES places(id),
-            weight          smallint NOT NULL DEFAULT 1,
-            created_at      timestamptz NOT NULL DEFAULT now(),
-            PRIMARY KEY (mission_id, user_id, place_id)
-        )
-        """
+    op.create_table(
+        "votes",
+        sa.Column(
+            "mission_id",
+            sa.String(36),
+            sa.ForeignKey("missions.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "user_id",
+            sa.String(36),
+            sa.ForeignKey("users.id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "place_id",
+            sa.String(36),
+            sa.ForeignKey("places.id"),
+            primary_key=True,
+        ),
+        sa.Column(
+            "weight", sa.SmallInteger(), nullable=False, server_default=sa.text("1")
+        ),
+        sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
 
     # ----- agent_run_steps -----
-    op.execute(
-        """
-        CREATE TABLE agent_run_steps (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            agent_run_id    uuid NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
-            node_name       text NOT NULL,
-            status          text NOT NULL,
-            input           jsonb,
-            output          jsonb,
-            tool_calls      jsonb,
-            error           text,
-            latency_ms      integer,
-            started_at      timestamptz NOT NULL,
-            finished_at     timestamptz
-        )
-        """
+    op.create_table(
+        "agent_run_steps",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column(
+            "agent_run_id",
+            sa.String(36),
+            sa.ForeignKey("agent_runs.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        sa.Column("node_name", sa.Text(), nullable=False),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("input", sa.JSON(), nullable=True),
+        sa.Column("output", sa.JSON(), nullable=True),
+        sa.Column("tool_calls", sa.JSON(), nullable=True),
+        sa.Column("error", sa.Text(), nullable=True),
+        sa.Column("latency_ms", sa.Integer(), nullable=True),
+        sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
     )
     op.create_index(
         "agent_run_steps_run_idx",
@@ -250,20 +350,30 @@ def upgrade() -> None:
     )
 
     # ----- incidents -----
-    op.execute(
-        """
-        CREATE TABLE incidents (
-            id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-            kind            text NOT NULL,
-            severity        text NOT NULL CHECK (severity IN ('info','warn','error','critical')),
-            status          text NOT NULL CHECK (status IN ('open','acknowledged','resolved')),
-            title           text NOT NULL,
-            details         jsonb NOT NULL,
-            related_run_id  uuid REFERENCES agent_runs(id),
-            opened_at       timestamptz NOT NULL DEFAULT now(),
-            resolved_at     timestamptz
-        )
-        """
+    op.create_table(
+        "incidents",
+        sa.Column("id", sa.String(36), primary_key=True),
+        sa.Column("kind", sa.Text(), nullable=False),
+        sa.Column("severity", sa.Text(), nullable=False),
+        sa.Column("status", sa.Text(), nullable=False),
+        sa.Column("title", sa.Text(), nullable=False),
+        sa.Column("details", sa.JSON(), nullable=False),
+        sa.Column(
+            "related_run_id",
+            sa.String(36),
+            sa.ForeignKey("agent_runs.id"),
+            nullable=True,
+        ),
+        sa.Column("opened_at", sa.DateTime(timezone=True), nullable=False),
+        sa.Column("resolved_at", sa.DateTime(timezone=True), nullable=True),
+        sa.CheckConstraint(
+            "severity IN ('info','warn','error','critical')",
+            name="incidents_severity_check",
+        ),
+        sa.CheckConstraint(
+            "status IN ('open','acknowledged','resolved')",
+            name="incidents_status_check",
+        ),
     )
     op.create_index(
         "incidents_status_idx",
@@ -273,43 +383,50 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    is_pg = _is_postgres()
+
     # Drop in reverse dependency order.
     op.drop_index("incidents_status_idx", table_name="incidents")
-    op.execute("DROP TABLE IF EXISTS incidents")
+    op.drop_table("incidents")
 
     op.drop_index("agent_run_steps_run_idx", table_name="agent_run_steps")
-    op.execute("DROP TABLE IF EXISTS agent_run_steps")
+    op.drop_table("agent_run_steps")
 
-    op.execute("DROP TABLE IF EXISTS votes")
+    op.drop_table("votes")
 
     op.drop_index("rankings_mission_run_idx", table_name="rankings")
-    op.execute("DROP TABLE IF EXISTS rankings")
+    op.drop_table("rankings")
 
     op.drop_index("agent_runs_status_idx", table_name="agent_runs")
     op.drop_index("agent_runs_mission_idx", table_name="agent_runs")
-    op.execute("DROP TABLE IF EXISTS agent_runs")
+    op.drop_table("agent_runs")
 
-    op.drop_constraint("missions_backup_place_id_fkey", "missions", type_="foreignkey")
-    op.drop_constraint("missions_winner_place_id_fkey", "missions", type_="foreignkey")
+    if is_pg:
+        op.drop_constraint(
+            "missions_backup_place_id_fkey", "missions", type_="foreignkey"
+        )
+        op.drop_constraint(
+            "missions_winner_place_id_fkey", "missions", type_="foreignkey"
+        )
+        op.execute("DROP INDEX IF EXISTS places_vibe_ivfflat_idx")
 
-    op.execute("DROP INDEX IF EXISTS places_vibe_ivfflat_idx")
     op.drop_index("places_expires_idx", table_name="places")
     op.drop_index("places_google_id_idx", table_name="places")
-    op.execute("DROP TABLE IF EXISTS places")
+    op.drop_table("places")
 
-    op.execute("DROP TABLE IF EXISTS preferences")
+    op.drop_table("preferences")
 
     op.drop_index("mission_invites_mission_idx", table_name="mission_invites")
-    op.execute("DROP TABLE IF EXISTS mission_invites")
+    op.drop_table("mission_invites")
 
-    op.execute("DROP TABLE IF EXISTS mission_members")
+    op.drop_table("mission_members")
 
     op.drop_index("missions_status_idx", table_name="missions")
     op.drop_index("missions_creator_idx", table_name="missions")
-    op.execute("DROP TABLE IF EXISTS missions")
+    op.drop_table("missions")
 
     op.drop_index("users_email_idx", table_name="users")
-    op.execute("DROP TABLE IF EXISTS users")
+    op.drop_table("users")
 
     # Leave extensions in place — other schemas (langgraph) may use them.
 

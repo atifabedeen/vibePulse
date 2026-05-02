@@ -2,34 +2,34 @@
 
 Reads/writes `state.candidates`. Drops candidates that:
 
-  * are missing the registry-side richer record (search_places didn't
-    populate it — defensive),
+  * are missing a corresponding ``places`` row (defensive),
   * have insufficient data for scoring (no rating, no price_level),
   * have a low rating (< 3.0),
   * are hard-rejected by `group_constraints` — i.e. share a cuisine
     with `cuisines_dislike`, or are clearly incompatible with a strict
     dietary restriction (vegetarian/vegan vs. bbq-only/sushi-only/etc.).
 
-Returns the filtered list. The registry is also pruned of dropped
-candidates so the downstream score node doesn't carry dead weight.
+Returns the filtered list. Place rows live in the ``places`` table; this
+node fetches them by id rather than relying on the old in-memory
+registry.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import select
+
+from ..db import get_async_session_factory
 from ..state import CandidatePlace, GraphState
-from ..state_ext import CANDIDATE_REGISTRY, ExtendedCandidate
+
+from app.models import Place  # noqa: E402
 
 
 # Cuisines that a strict vegetarian member should not be sent to.
-# (Conservative — these are establishments where the menu is overwhelmingly
-# meat-forward and there's no reliable veg option signaled.)
 _VEG_HARD_REJECT_CUISINES = {"bbq"}
 
-# Cuisines where a vegan member is realistically catered to. The fixture
-# and real Places data don't always tag `vegan_options`, so we use cuisine
-# heuristics — see implementation.md sec 8.2 score row.
+# Cuisines where a vegan member is realistically catered to.
 _VEGAN_FRIENDLY_CUISINES = {
     "vegan",
     "thai",
@@ -38,23 +38,23 @@ _VEGAN_FRIENDLY_CUISINES = {
 }
 
 
-def _has_essential_fields(ext: ExtendedCandidate | None) -> bool:
-    if ext is None:
+def _has_essential_fields(place: Place | None) -> bool:
+    if place is None:
         return False
-    if ext.rating is None or ext.price_level is None:
+    if place.rating is None or place.price_level is None:
         return False
     return True
 
 
 def _is_hard_rejected(
-    ext: ExtendedCandidate,
+    place: Place,
     constraints: dict[str, Any] | None,
 ) -> tuple[bool, str]:
     """Return (rejected, reason). Reason is informational only."""
     if not constraints:
         return False, ""
 
-    cuisines = {c.lower() for c in ext.cuisines}
+    cuisines = {c.lower() for c in (place.cuisines or [])}
 
     dislikes = {c.lower() for c in (constraints.get("cuisines_dislike") or [])}
     overlap = cuisines & dislikes
@@ -62,18 +62,19 @@ def _is_hard_rejected(
         return True, f"cuisine in dislikes: {sorted(overlap)}"
 
     dietary = {d.lower() for d in (constraints.get("dietary_restrictions") or [])}
+    raw_blob = dict(place.raw_blob or {})
 
     if "vegan" in dietary:
-        # The candidate must be in a vegan-friendly cuisine bucket OR
-        # explicitly flag vegan options in the raw blob.
+        # Vegan signal can come from (a) a vegan-friendly cuisine, (b) an
+        # explicit vegan_options flag, or (c) a vegetarian_options flag —
+        # vegetarian-friendly places generally have at least one vegan dish
+        # and are scored lower (not hard-rejected) downstream.
         vegan_ok = bool(cuisines & _VEGAN_FRIENDLY_CUISINES)
-        if not vegan_ok and not ext.raw_blob.get("vegan_options"):
+        if not vegan_ok and not raw_blob.get("vegan_options") and not raw_blob.get("vegetarian_options"):
             return True, "no vegan-friendly cuisine signal"
 
     if "vegetarian" in dietary:
-        # If we have an explicit vegetarian_options=False from the raw blob,
-        # that's a hard no. Otherwise reject only on bbq-only joints.
-        veg_flag = ext.raw_blob.get("vegetarian_options")
+        veg_flag = raw_blob.get("vegetarian_options")
         if veg_flag is False:
             return True, "raw_blob marks no vegetarian options"
         if cuisines & _VEG_HARD_REJECT_CUISINES and not veg_flag:
@@ -85,34 +86,33 @@ def _is_hard_rejected(
 async def normalize_places(state: GraphState) -> dict[str, Any]:
     """Filter `state.candidates` down to the scoreable, viable set."""
     constraints = state.group_constraints
+    if not state.candidates:
+        return {"candidates": []}
+
+    place_ids = [str(c.place_id) for c in state.candidates]
+    factory = get_async_session_factory()
+    async with factory() as session:
+        rows = (
+            await session.execute(select(Place).where(Place.id.in_(place_ids)))
+        ).scalars().all()
+
+    by_id: dict[str, Place] = {row.id: row for row in rows}
+
     kept: list[CandidatePlace] = []
-    dropped_ids: list[str] = []
-
     for cand in state.candidates:
-        key = str(cand.place_id)
-        ext = CANDIDATE_REGISTRY.get(key)
+        place = by_id.get(str(cand.place_id))
+        if not _has_essential_fields(place):
+            continue
+        assert place is not None  # narrowed by the guard above
 
-        if not _has_essential_fields(ext):
-            dropped_ids.append(key)
+        if float(place.rating) < 3.0:
             continue
 
-        # mypy/runtime: ext is non-None past the guard.
-        assert ext is not None
-
-        if ext.rating < 3.0:
-            dropped_ids.append(key)
-            continue
-
-        rejected, _reason = _is_hard_rejected(ext, constraints)
+        rejected, _reason = _is_hard_rejected(place, constraints)
         if rejected:
-            dropped_ids.append(key)
             continue
 
         kept.append(cand)
-
-    # Prune the registry so downstream nodes see a clean view.
-    for key in dropped_ids:
-        CANDIDATE_REGISTRY.pop(key, None)
 
     return {"candidates": kept}
 
@@ -124,11 +124,9 @@ if __name__ == "__main__":
     import asyncio
 
     from ..fixtures.sample_mission import sample_mission_state
-    from ..state_ext import reset_registry
     from .search_places import search_places
 
     async def _smoke() -> None:
-        reset_registry()
         state = sample_mission_state()
         state.group_constraints = {
             "cuisines_like": ["italian", "thai"],

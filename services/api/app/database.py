@@ -13,14 +13,24 @@ from app.config import Settings, get_settings
 
 
 def make_async_engine(settings: Settings | None = None) -> AsyncEngine:
+    """Build an async engine for whatever DATABASE_URL is configured.
+
+    Supports two dialects:
+      * Postgres via ``postgresql+psycopg://...`` (psycopg v3, sync+async on
+        the same URL)
+      * SQLite via ``sqlite+aiosqlite:///./vibebite.db`` (file-based, no
+        server required)
+    """
     cfg = settings or get_settings()
-    # psycopg v3 supports async via the same `postgresql+psycopg` URL.
-    return create_async_engine(
-        cfg.async_database_url,
-        echo=False,
-        pool_pre_ping=True,
-        future=True,
-    )
+    url = cfg.async_database_url
+
+    # SQLite ignores most pool kwargs; we keep a small kwarg surface so the
+    # same call works for both dialects.
+    kwargs: dict = {"echo": False, "future": True}
+    if not url.startswith("sqlite"):
+        kwargs["pool_pre_ping"] = True
+
+    return create_async_engine(url, **kwargs)
 
 
 _engine: AsyncEngine | None = None

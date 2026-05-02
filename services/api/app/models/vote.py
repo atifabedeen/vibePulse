@@ -1,30 +1,32 @@
 from __future__ import annotations
 
-import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-from sqlalchemy import ForeignKey, SmallInteger, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import DateTime, ForeignKey, SmallInteger, String, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class Vote(Base):
     __tablename__ = "votes"
 
-    mission_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    mission_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("missions.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    user_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    place_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    place_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("places.id"),
         primary_key=True,
     )
@@ -32,5 +34,5 @@ class Vote(Base):
         SmallInteger, nullable=False, server_default=text("1")
     )
     created_at: Mapped[datetime] = mapped_column(
-        server_default=text("now()"), nullable=False
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )

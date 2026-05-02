@@ -183,7 +183,7 @@ async def parse_preferences(state: GraphState) -> dict[str, Any]:
     for member in state.member_prefs:
         if member.raw_comment:
             messages = _build_messages(member)
-            parsed = llm.chat_completion(messages, response_model=GroupConstraints)
+            parsed = await llm.chat_completion(messages, response_model=GroupConstraints)
         else:
             parsed = GroupConstraints(summary="no raw_comment provided")
 

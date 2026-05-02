@@ -782,6 +782,8 @@ class GraphState(BaseModel):
 | `replan` | new constraint trigger | `group_constraints` (updated) | Branches back to `search_places` if location changed, else `score_candidates` |
 | `reliability_check` | `state` (always-on tap) | — | Detects API degradation, low-confidence rankings; writes `incidents` |
 
+> **C3 status:** the C2 in-memory `state_ext.CANDIDATE_REGISTRY` is gone — `search_places` now upserts directly into the `places` table and `normalize_places`/`score_candidates`/`explain_candidates` re-fetch the rich place fields by id. Every graph invocation also writes one `agent_runs` row, one `agent_run_steps` row per node, and `rankings` rows for the explained top-5 (with `reasons={pros, cons}`). See `services/agents/vibebite_agents/audit.py`.
+
 ### 8.3 Edges
 
 ```text

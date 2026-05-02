@@ -9,60 +9,74 @@ Writes:
   * `state.candidates` — list[CandidatePlace] (raw, unscored)
 
 Side effect:
-  * Populates `state_ext.CANDIDATE_REGISTRY` so that `normalize_places`
-    and `score_candidates` can read the richer `PlaceResult` fields
-    that don't fit on `CandidatePlace`. See `state_ext.py` for why.
+  * Upserts every fetched ``PlaceResult`` into the ``places`` table. The
+    DB row's ``id`` (string UUID) becomes the ``CandidatePlace.place_id``
+    so downstream nodes can look the place back up by id.
 
-In C3 this node will write upserts into the `places` table and emit
-`places_api_calls_total`; for C2 the side-channel registry is enough.
+This replaces the C2 in-memory ``state_ext.CANDIDATE_REGISTRY`` hack:
+all richer place fields (price_level, rating, cuisines, raw_blob, …) now
+live in SQLite and are read back by ``normalize_places`` and
+``score_candidates``.
 """
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
+
 from ..clients.places_client import GooglePlacesClient
 from ..clients.places_stub import PlaceResult
+from ..db import get_async_session_factory
 from ..state import CandidatePlace, GraphState
-from ..state_ext import CANDIDATE_REGISTRY, ExtendedCandidate
+
+# Import inside the module so import-time failures of `app.database` don't
+# break stub-only callers. ``Place`` is referenced unconditionally below.
+from app.models import Place  # noqa: E402
+
+# How long a fetched Places row stays fresh before requiring a re-fetch.
+_PLACES_TTL = timedelta(days=7)
 
 
 def _build_query(group_constraints: dict[str, Any] | None) -> str:
-    """Compose a text query from the group's cuisine likes.
-
-    Falls back to a generic 'restaurants' query when there's nothing
-    to bias on. Real Places Text Search responds noticeably better to
-    a cuisine-flavoured query than to an empty one.
-    """
+    """Compose a text query from the group's cuisine likes."""
     if not group_constraints:
         return "restaurants"
     likes = group_constraints.get("cuisines_like") or []
     if not likes:
         return "restaurants"
-    # Join with spaces — Text Search treats this as a soft OR.
     return " ".join(likes) + " restaurants"
 
 
-def _to_candidate(place: PlaceResult) -> CandidatePlace:
-    """Convert a `PlaceResult` to the lean `CandidatePlace` carried in state.
+async def _upsert_place(session, place: PlaceResult) -> str:
+    """Upsert one place row keyed by ``google_place_id``. Return its ``id``."""
+    now = datetime.now(timezone.utc)
+    expires = now + _PLACES_TTL
 
-    `score`, `pros`, `cons` are deliberately left at their defaults;
-    `score_candidates` fills them.
-    """
-    return CandidatePlace(
-        place_id=UUID(place.id),
+    stmt = select(Place).where(Place.google_place_id == place.google_place_id)
+    existing = (await session.execute(stmt)).scalar_one_or_none()
+
+    if existing is not None:
+        existing.name = place.name
+        existing.address = place.address
+        existing.lat = place.lat
+        existing.lng = place.lng
+        existing.price_level = place.price_level
+        existing.rating = place.rating
+        existing.user_rating_ct = place.user_rating_ct
+        existing.cuisines = list(place.cuisines)
+        existing.raw_blob = dict(place.raw_blob)
+        existing.fetched_at = now
+        existing.expires_at = expires
+        await session.flush()
+        return existing.id
+
+    row = Place(
         google_place_id=place.google_place_id,
         name=place.name,
-    )
-
-
-def _register_extended(place: PlaceResult) -> None:
-    """Stash the richer fields so downstream nodes can score them."""
-    CANDIDATE_REGISTRY[place.id] = ExtendedCandidate(
-        place_id=place.id,
-        google_place_id=place.google_place_id,
-        name=place.name,
+        address=place.address,
         lat=place.lat,
         lng=place.lng,
         price_level=place.price_level,
@@ -70,11 +84,16 @@ def _register_extended(place: PlaceResult) -> None:
         user_rating_ct=place.user_rating_ct,
         cuisines=list(place.cuisines),
         raw_blob=dict(place.raw_blob),
+        fetched_at=now,
+        expires_at=expires,
     )
+    session.add(row)
+    await session.flush()
+    return row.id
 
 
 async def search_places(state: GraphState) -> dict[str, Any]:
-    """Run a Places Text Search and return the resulting candidates."""
+    """Run a Places Text Search, persist rows, return CandidatePlaces."""
     client = GooglePlacesClient()
     lat, lng = state.location
     query = _build_query(state.group_constraints)
@@ -86,10 +105,23 @@ async def search_places(state: GraphState) -> dict[str, Any]:
         radius_m=state.search_radius_m,
     )
 
+    factory = get_async_session_factory()
     candidates: list[CandidatePlace] = []
-    for place in results:
-        _register_extended(place)
-        candidates.append(_to_candidate(place))
+    async with factory() as session:
+        try:
+            for place in results:
+                place_id = await _upsert_place(session, place)
+                candidates.append(
+                    CandidatePlace(
+                        place_id=UUID(place_id),
+                        google_place_id=place.google_place_id,
+                        name=place.name,
+                    )
+                )
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
 
     return {"candidates": candidates}
 
@@ -101,12 +133,9 @@ if __name__ == "__main__":
     import asyncio
 
     from ..fixtures.sample_mission import sample_mission_state
-    from ..state_ext import reset_registry
 
     async def _smoke() -> None:
-        reset_registry()
         state = sample_mission_state()
-        # Provide a minimal group_constraints so the query is non-trivial.
         state.group_constraints = {
             "cuisines_like": ["italian", "thai"],
             "cuisines_dislike": [],
@@ -117,7 +146,6 @@ if __name__ == "__main__":
         }
         update = await search_places(state)
         print(f"search_places fetched {len(update['candidates'])} candidates")
-        print(f"registry size: {len(CANDIDATE_REGISTRY)}")
         for c in update["candidates"][:3]:
             print(f"  - {c.name} ({c.google_place_id})")
 

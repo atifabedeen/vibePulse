@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import secrets
-import uuid
 from datetime import datetime, timedelta, timezone
 
 import structlog
@@ -31,12 +30,13 @@ log = structlog.get_logger(__name__)
 
 _pwd = CryptContext(schemes=["argon2"], deprecated="auto")
 
-# Stable UUIDs so reruns are idempotent and downstream fixtures can reference them.
-ALICE_ID = uuid.UUID("11111111-1111-1111-1111-111111111111")
-BOB_ID = uuid.UUID("22222222-2222-2222-2222-222222222222")
-CARA_ID = uuid.UUID("33333333-3333-3333-3333-333333333333")
-MISSION_ID = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
-INVITE_ID = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+# Stable UUIDs (as strings) so reruns are idempotent and downstream fixtures
+# can reference them. Strings keep us portable across Postgres + SQLite.
+ALICE_ID = "11111111-1111-1111-1111-111111111111"
+BOB_ID = "22222222-2222-2222-2222-222222222222"
+CARA_ID = "33333333-3333-3333-3333-333333333333"
+MISSION_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+INVITE_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 INVITE_TOKEN = "seed-invite-token-do-not-use-in-prod"
 
 # Atlanta center, mirrors the example in spec sec 2.
@@ -47,31 +47,33 @@ ATLANTA_LNG = -84.3880
 async def _upsert_user(
     session: AsyncSession,
     *,
-    user_id: uuid.UUID,
+    user_id: str,
     email: str,
     display_name: str,
     password: str,
 ) -> User:
     existing = await session.get(User, user_id)
     if existing is not None:
-        log.info("seed_user_exists", user_id=str(user_id), email=email)
+        log.info("seed_user_exists", user_id=user_id, email=email)
         return existing
     user = User(
         id=user_id,
-        email=email,
+        # citext is gone — lowercase the email here so the unique index
+        # behaves case-insensitively across both dialects.
+        email=email.lower(),
         display_name=display_name,
         password_hash=_pwd.hash(password),
     )
     session.add(user)
     await session.flush()
-    log.info("seed_user_created", user_id=str(user_id), email=email)
+    log.info("seed_user_created", user_id=user_id, email=email)
     return user
 
 
-async def _upsert_mission(session: AsyncSession, *, creator_id: uuid.UUID) -> Mission:
+async def _upsert_mission(session: AsyncSession, *, creator_id: str) -> Mission:
     existing = await session.get(Mission, MISSION_ID)
     if existing is not None:
-        log.info("seed_mission_exists", mission_id=str(MISSION_ID))
+        log.info("seed_mission_exists", mission_id=MISSION_ID)
         return existing
     mission = Mission(
         id=MISSION_ID,
@@ -85,15 +87,15 @@ async def _upsert_mission(session: AsyncSession, *, creator_id: uuid.UUID) -> Mi
     )
     session.add(mission)
     await session.flush()
-    log.info("seed_mission_created", mission_id=str(MISSION_ID))
+    log.info("seed_mission_created", mission_id=MISSION_ID)
     return mission
 
 
 async def _upsert_member(
     session: AsyncSession,
     *,
-    mission_id: uuid.UUID,
-    user_id: uuid.UUID,
+    mission_id: str,
+    user_id: str,
     role: str,
 ) -> None:
     stmt = select(MissionMember).where(
@@ -104,13 +106,13 @@ async def _upsert_member(
         return
     session.add(MissionMember(mission_id=mission_id, user_id=user_id, role=role))
     await session.flush()
-    log.info("seed_member_created", user_id=str(user_id), role=role)
+    log.info("seed_member_created", user_id=user_id, role=role)
 
 
 async def _upsert_invite(session: AsyncSession) -> None:
     existing = await session.get(MissionInvite, INVITE_ID)
     if existing is not None:
-        log.info("seed_invite_exists", invite_id=str(INVITE_ID))
+        log.info("seed_invite_exists", invite_id=INVITE_ID)
         return
     session.add(
         MissionInvite(
@@ -123,13 +125,13 @@ async def _upsert_invite(session: AsyncSession) -> None:
         )
     )
     await session.flush()
-    log.info("seed_invite_created", invite_id=str(INVITE_ID), token=INVITE_TOKEN)
+    log.info("seed_invite_created", invite_id=INVITE_ID, token=INVITE_TOKEN)
 
 
 async def _upsert_preference(
     session: AsyncSession,
     *,
-    user_id: uuid.UUID,
+    user_id: str,
     payload: dict,
 ) -> None:
     stmt = select(Preference).where(
@@ -140,7 +142,7 @@ async def _upsert_preference(
         return
     session.add(Preference(mission_id=MISSION_ID, user_id=user_id, **payload))
     await session.flush()
-    log.info("seed_preference_created", user_id=str(user_id))
+    log.info("seed_preference_created", user_id=user_id)
 
 
 async def seed() -> None:

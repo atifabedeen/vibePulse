@@ -53,4 +53,5 @@ logs/
 # Local databases / caches
 *.sqlite
 *.sqlite3
+*.db
 .cache/

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 from sqlalchemy import (
     CheckConstraint,
+    DateTime,
     Float,
     ForeignKey,
     Index,
     Integer,
+    String,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -23,21 +25,25 @@ _MISSION_STATUSES = ("draft", "collecting", "ranking", "voting", "decided", "can
 _MEMBER_ROLES = ("owner", "member")
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _new_uuid() -> str:
+    return str(uuid.uuid4())
+
+
 class Mission(Base):
     __tablename__ = "missions"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    creator_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    creator_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("users.id", ondelete="RESTRICT"),
         nullable=False,
     )
     title: Mapped[str] = mapped_column(nullable=False)
-    description: Mapped[str | None] = mapped_column(nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(nullable=False)
 
     location_lat: Mapped[float] = mapped_column(Float, nullable=False)
@@ -45,24 +51,30 @@ class Mission(Base):
     search_radius_m: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("3000")
     )
-    scheduled_for: Mapped[datetime | None] = mapped_column(nullable=True)
+    scheduled_for: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
-    winner_place_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    # NOTE: SQLite can't ALTER a table to add a FK after the fact, and these two
+    # columns reference `places(id)` which is created later in the migration.
+    # We declare ForeignKey at the ORM level so cascade/relationship logic works
+    # in Python; the migration only emits the actual DB-level FK on Postgres.
+    winner_place_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
         ForeignKey("places.id"),
         nullable=True,
     )
-    backup_place_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True),
+    backup_place_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
         ForeignKey("places.id"),
         nullable=True,
     )
 
     created_at: Mapped[datetime] = mapped_column(
-        server_default=text("now()"), nullable=False
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )
     updated_at: Mapped[datetime] = mapped_column(
-        server_default=text("now()"), nullable=False
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
     )
 
     __table_args__ = (
@@ -78,19 +90,19 @@ class Mission(Base):
 class MissionMember(Base):
     __tablename__ = "mission_members"
 
-    mission_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    mission_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("missions.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    user_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    user_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("users.id", ondelete="CASCADE"),
         primary_key=True,
     )
     role: Mapped[str] = mapped_column(nullable=False)
     joined_at: Mapped[datetime] = mapped_column(
-        server_default=text("now()"), nullable=False
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
     __table_args__ = (
@@ -104,18 +116,16 @@ class MissionMember(Base):
 class MissionInvite(Base):
     __tablename__ = "mission_invites"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        primary_key=True,
-        server_default=text("gen_random_uuid()"),
-    )
-    mission_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_uuid)
+    mission_id: Mapped[str] = mapped_column(
+        String(36),
         ForeignKey("missions.id", ondelete="CASCADE"),
         nullable=False,
     )
     token: Mapped[str] = mapped_column(unique=True, nullable=False)
-    expires_at: Mapped[datetime] = mapped_column(nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
     max_uses: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("10")
     )
@@ -123,7 +133,7 @@ class MissionInvite(Base):
         Integer, nullable=False, server_default=text("0")
     )
     created_at: Mapped[datetime] = mapped_column(
-        server_default=text("now()"), nullable=False
+        DateTime(timezone=True), nullable=False, default=_utcnow
     )
 
     __table_args__ = (Index("mission_invites_mission_idx", "mission_id"),)

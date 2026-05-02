@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Repo root `.env` path: services/api/app/config.py -> repo root is parents[3].
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_REPO_ROOT_ENV = _REPO_ROOT / ".env"
+# Anchor SQLite DB at a fixed absolute path so the same DB is used regardless
+# of CWD. RunPod / Postgres overrides this entirely via DATABASE_URL.
+_DEFAULT_SQLITE_PATH = _REPO_ROOT / "services" / "api" / "vibebite.db"
 
 
 class Settings(BaseSettings):
@@ -13,10 +21,17 @@ class Settings(BaseSettings):
     own subsets in their own `config.py`.
     """
 
-    # Connection strings
+    # Connection strings.
+    # Default to a file-based SQLite DB so a clean checkout can run with zero
+    # external infra. For RunPod / production, override DATABASE_URL with a
+    # `postgresql+psycopg://...` URL.
     database_url: str = Field(
-        default="postgresql+psycopg://vibebite:vibebite@localhost:5432/vibebite",
-        description="Postgres URL. psycopg v3 driver works for both sync (alembic) and async.",
+        default=f"sqlite+aiosqlite:///{_DEFAULT_SQLITE_PATH}",
+        description=(
+            "DB URL. Defaults to SQLite (aiosqlite) at services/api/vibebite.db "
+            "(absolute path; CWD-independent). Override with "
+            "`postgresql+psycopg://...` on Postgres/RunPod."
+        ),
     )
     redis_url: str = Field(default="redis://localhost:6379/0")
 
@@ -30,7 +45,9 @@ class Settings(BaseSettings):
     service_name: str = Field(default="vibebite-api")
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        # Look at both repo-root .env (preferred) and CWD .env (fallback) so
+        # the same code works whether invoked from repo root or services/api/.
+        env_file=(str(_REPO_ROOT_ENV), ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -40,14 +57,18 @@ class Settings(BaseSettings):
     def async_database_url(self) -> str:
         """Async URL for SQLAlchemy's create_async_engine.
 
-        psycopg v3 exposes the async driver via the `postgresql+psycopg` URL
-        with the engine in async mode. Coerce common alternates here too.
+        Coerces common alternates so callers can pass either the sync or the
+        async form interchangeably.
         """
         url = self.database_url
+        # Postgres: psycopg v3 exposes both sync and async on `postgresql+psycopg`.
         if url.startswith("postgresql+asyncpg"):
             return url.replace("postgresql+asyncpg", "postgresql+psycopg", 1)
         if url.startswith("postgresql://"):
             return url.replace("postgresql://", "postgresql+psycopg://", 1)
+        # SQLite: plain `sqlite://` -> `sqlite+aiosqlite://` for async.
+        if url.startswith("sqlite://") and not url.startswith("sqlite+"):
+            return url.replace("sqlite://", "sqlite+aiosqlite://", 1)
         return url
 
     @property
@@ -58,6 +79,9 @@ class Settings(BaseSettings):
             return url.replace("postgresql+asyncpg", "postgresql+psycopg", 1)
         if url.startswith("postgresql://"):
             return url.replace("postgresql://", "postgresql+psycopg://", 1)
+        # Alembic uses the stdlib sqlite3 driver — strip aiosqlite if present.
+        if url.startswith("sqlite+aiosqlite"):
+            return url.replace("sqlite+aiosqlite", "sqlite", 1)
         return url
 
 
