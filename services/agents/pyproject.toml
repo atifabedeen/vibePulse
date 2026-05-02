@@ -9,6 +9,7 @@ dependencies = [
   "structlog>=24.1",
   "eval-type-backport>=0.2",  # lets Pydantic v2 evaluate `X | None` on Python 3.9
   "langgraph>=0.2.50",
+  "langgraph-checkpoint-sqlite>=2.0",
   "rich>=13.0",
   "google-genai>=1.0",
   "python-dotenv>=1.0",

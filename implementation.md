@@ -797,9 +797,11 @@ reliability_check is a parallel node attached after every external-API node
 (search_places, explain_candidates) and writes incidents without blocking the path.
 ```
 
+> **C4 status:** the HITL gate (`await_approval`) and `replan` cycle are wired in. After `select_winner` the graph fires `interrupt(...)` carrying the proposed winner; the caller resumes via `Command(resume={"decision": "approve"|"reject", ...})`. On rejection, `replan` applies caller-supplied overrides on top of `group_constraints` and routes back to `score_candidates → explain_candidates → select_winner → await_approval`. The loop is capped at `MAX_REPLAN_ITERATIONS = 3`; on the third rejection the gate force-approves with a warning so the graph cannot loop forever. Each replan iteration produces fresh `agent_run_steps` rows and a fresh batch of `rankings` rows tagged with the same `agent_run_id` (latest `created_at` wins as the "current" view).
+
 ### 8.4 Checkpointer & HITL
 
-- Checkpointer: `langgraph.checkpoint.postgres.PostgresSaver`, schema `langgraph` (see §6.3).
+- Checkpointer: `langgraph.checkpoint.postgres.PostgresSaver`, schema `langgraph` (see §6.3). C4 currently uses the SQLite cousin (`langgraph.checkpoint.sqlite.aio.AsyncSqliteSaver`, file: `services/api/vibebite.db`) so the demo run persists across the `interrupt()` boundary.
 - Interrupt points (explicit): **`select_winner`** (group/owner must confirm winner) and **`replan`** (owner must confirm constraint change is intentional, not a misclick). All other nodes run autonomously.
 - Resumption: API endpoint `POST /agents/runs/{id}/approve|reject` calls `graph.update_state(...)` then `graph.invoke(None, config)` to continue.
 - Timeouts: `collect_votes` has a 30-minute soft timeout; if quorum not reached, proceeds with partial votes and writes an `incidents` row (`severity=warn`).

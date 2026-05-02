@@ -1,16 +1,25 @@
-"""CLI demo runner for the C3-slice LangGraph.
+"""CLI demo runner for the C4-slice LangGraph.
 
 Loads the canonical 5-member fixture mission, runs the full graph
 (``parse_preferences`` -> ``search_places`` -> ``normalize_places`` ->
-``score_candidates`` -> ``explain_candidates``), persists every step to
-SQLite, and pretty-prints the merged group constraints, the top-5
-ranked candidates, and a summary of the agent_run row.
+``score_candidates`` -> ``explain_candidates`` -> ``select_winner`` ->
+[HITL gate]), persists every step to SQLite, and pretty-prints the
+merged group constraints, the top-5 ranked candidates, the proposed
+winner each iteration, and a summary of the agent_run row.
+
+The HITL gate uses LangGraph's ``interrupt()`` / ``Command(resume=...)``
+loop. By default, the demo auto-approves the first proposed winner.
+``--reject`` simulates one rejection (looser budget) then approve;
+``--reject-twice`` rejects twice and accepts the third proposal; the
+graph caps replan loops at 3 iterations and force-approves after that.
 
 Usage::
 
-    python -m vibebite_agents.run_demo            # one-shot run, full DB persistence
-    python -m vibebite_agents.run_demo --no-db    # skip DB writes (offline mode)
-    python -m vibebite_agents.run_demo --verbose  # dump full state per step
+    python -m vibebite_agents.run_demo
+    python -m vibebite_agents.run_demo --reject
+    python -m vibebite_agents.run_demo --reject-twice
+    python -m vibebite_agents.run_demo --no-db
+    python -m vibebite_agents.run_demo --verbose
 
 Exits 0 on success, non-zero on any unhandled exception.
 """
@@ -20,8 +29,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from typing import Any
+from uuid import uuid4
 
 # Load repo-root .env BEFORE importing modules that read GEMINI_API_KEY etc.
 try:
@@ -31,27 +42,42 @@ try:
 except ImportError:
     pass
 
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.types import Command
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
 from .fixtures.sample_mission import sample_mission_state
-from .graph import build_graph
+from .graph import MAX_REPLAN_ITERATIONS, build_graph
 from .state import CandidatePlace, GraphState
 
 # Static fixture-derived ids used by the seeded mission row in the API DB.
 _SEED_MISSION_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
+# The SQLite file the API service already uses; the LangGraph checkpointer
+# creates its own ``checkpoints``/``writes`` tables that don't collide.
+_DEFAULT_CHECKPOINT_DB = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "api",
+    "vibebite.db",
+)
 
-def _coerce_state(raw: Any) -> GraphState:
+
+def _coerce_state(raw: Any) -> Any:
     if isinstance(raw, GraphState):
         return raw
     if isinstance(raw, dict):
-        return GraphState.model_validate(raw)
+        try:
+            return GraphState.model_validate(raw)
+        except Exception:
+            return raw
     try:
         return GraphState.model_validate(dict(raw))
     except Exception:
-        return raw  # type: ignore[return-value]
+        return raw
 
 
 def _pretty_print_constraints(console: Console, constraints: dict | None) -> None:
@@ -59,7 +85,9 @@ def _pretty_print_constraints(console: Console, constraints: dict | None) -> Non
         console.print(Panel("[yellow](no merged group_constraints produced)[/yellow]",
                             title="Merged group constraints"))
         return
-    body = json.dumps(constraints, indent=2, sort_keys=True, default=str)
+    # Hide the internal _replan_iteration counter from the user view.
+    view = {k: v for k, v in constraints.items() if not k.startswith("_replan_")}
+    body = json.dumps(view, indent=2, sort_keys=True, default=str)
     console.print(Panel(body, title="Merged group constraints", expand=False))
 
 
@@ -125,7 +153,7 @@ async def _print_run_summary(console: Console, agent_run_id: str) -> None:
                 select(Ranking, Place)
                 .join(Place, Ranking.place_id == Place.id)
                 .where(Ranking.agent_run_id == agent_run_id)
-                .order_by(Ranking.rank)
+                .order_by(Ranking.created_at.desc(), Ranking.rank)
             )
         ).all()
 
@@ -158,30 +186,173 @@ async def _print_run_summary(console: Console, agent_run_id: str) -> None:
         )
     console.print(step_table)
 
-    rank_table = Table(title="rankings (DB)", show_lines=False)
+    rank_table = Table(title="rankings (DB; all iterations)", show_lines=False)
     rank_table.add_column("rank", justify="right")
     rank_table.add_column("place")
     rank_table.add_column("score", justify="right")
+    rank_table.add_column("created_at")
+    # Show every ranking row tagged with this run; iteration boundaries
+    # are visible in the created_at column so the human can trust the
+    # sequence (each batch shares a near-identical timestamp).
     for ranking, place in rankings:
-        rank_table.add_row(str(ranking.rank), place.name, f"{float(ranking.score):.2f}")
+        rank_table.add_row(
+            str(ranking.rank),
+            place.name,
+            f"{float(ranking.score):.2f}",
+            ranking.created_at.strftime("%H:%M:%S.%f")[:-3] if ranking.created_at else "-",
+        )
     console.print(rank_table)
+
+
+def _decision_for_iteration(args: argparse.Namespace, iteration: int) -> dict[str, Any]:
+    """Return the simulated user resume payload for the given iteration index.
+
+    Iteration 0 is the FIRST proposed winner. ``--reject`` rejects only on
+    iteration 0; ``--reject-twice`` rejects on iterations 0 and 1.
+    """
+    if args.reject_twice and iteration < 2:
+        return {
+            "decision": "reject",
+            "reason": (
+                "user wants something cheaper (1st reject)"
+                if iteration == 0
+                else "still too pricey (2nd reject)"
+            ),
+            "overrides": {
+                "budget_max_cents": 1500 if iteration == 0 else 1000,
+            },
+        }
+    if args.reject and iteration == 0:
+        return {
+            "decision": "reject",
+            "reason": "user wants something cheaper",
+            "overrides": {"budget_max_cents": 1000},
+        }
+    return {"decision": "approve"}
+
+
+async def _run_with_hitl(
+    console: Console,
+    args: argparse.Namespace,
+    audit_holder: dict[str, str | None],
+    initial_state_dict: dict[str, Any],
+) -> tuple[Any, list[dict[str, Any]]]:
+    """Drive the graph through interrupt/resume cycles until END or cap.
+
+    Returns ``(final_payload, iteration_log)``. ``iteration_log`` is a list
+    of dicts (one per HITL gate hit) with the proposed winner and the
+    user's decision -- used for the post-run summary print.
+    """
+    iteration_log: list[dict[str, Any]] = []
+
+    # Use AsyncSqliteSaver (LangGraph 0.6's async ctx-manager API).
+    async with AsyncSqliteSaver.from_conn_string(_DEFAULT_CHECKPOINT_DB) as saver:
+        graph = build_graph(audit_run_id_holder=audit_holder, checkpointer=saver)
+
+        # A unique thread_id per demo run so checkpoints don't collide
+        # across repeated invocations.
+        thread_id = str(uuid4())
+        config: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+
+        # First pass: kick off until the first interrupt or terminal end.
+        result = await graph.ainvoke(initial_state_dict, config=config)
+
+        iteration = 0
+        while True:
+            # Detect interrupt: LangGraph 0.6 surfaces interrupts via the
+            # ``__interrupt__`` key on the streamed/returned state dict.
+            interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+            if not interrupts:
+                # Graph reached END (or there was nothing to interrupt on).
+                return result, iteration_log
+
+            # Inspect the first interrupt's payload (we only have one HITL
+            # gate node so there's always exactly one).
+            try:
+                ev = interrupts[0]
+                payload = getattr(ev, "value", None) or {}
+            except Exception:  # noqa: BLE001
+                payload = {}
+
+            proposed = payload.get("winner") if isinstance(payload, dict) else None
+            iter_idx = payload.get("iteration", iteration) if isinstance(payload, dict) else iteration
+
+            console.print()
+            console.print(
+                Panel(
+                    json.dumps(proposed, indent=2, default=str) if proposed else "(none)",
+                    title=f"HITL gate (iteration {iter_idx + 1}) -- proposed winner",
+                    expand=False,
+                )
+            )
+
+            if iter_idx >= MAX_REPLAN_ITERATIONS:
+                # Should already have been auto-approved inside await_approval,
+                # but be defensive.
+                decision = {"decision": "approve"}
+                console.print("[yellow]Replan cap reached -- auto-approving.[/yellow]")
+            else:
+                decision = _decision_for_iteration(args, iter_idx)
+                console.print(
+                    f"[bold]simulated decision:[/bold] {decision['decision']}"
+                    + (f"  (reason: {decision.get('reason')})" if decision.get("reason") else "")
+                )
+
+            iteration_log.append(
+                {
+                    "iteration": iter_idx + 1,
+                    "proposed_winner": proposed,
+                    "decision": decision["decision"],
+                    "reason": decision.get("reason"),
+                    "overrides": decision.get("overrides"),
+                }
+            )
+
+            # Optionally write a fresh batch of rankings rows for THIS
+            # proposal so the audit trail records every iteration's top-5.
+            if audit_holder.get("id") and not args.no_db:
+                try:
+                    from .audit import write_rankings
+
+                    snap = await graph.aget_state(config)
+                    cur_state = snap.values if snap is not None else {}
+                    shortlist = cur_state.get("shortlist") or []
+                    if shortlist:
+                        coerced = [
+                            c
+                            if isinstance(c, CandidatePlace)
+                            else CandidatePlace.model_validate(c)
+                            for c in shortlist
+                        ]
+                        await write_rankings(
+                            mission_id=_SEED_MISSION_ID,
+                            agent_run_id=audit_holder["id"],
+                            ranked_candidates=coerced,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    console.print(
+                        f"[yellow]warn: per-iteration write_rankings failed: {exc!r}[/yellow]"
+                    )
+
+            # Resume the graph with the user's decision.
+            result = await graph.ainvoke(Command(resume=decision), config=config)
+            iteration = iter_idx + 1
 
 
 async def _async_main(args: argparse.Namespace) -> int:
     console = Console()
     console.print(
-        "[bold]VibeBite C3 demo[/bold] — building graph and loading fixture mission..."
+        "[bold]VibeBite C4 demo[/bold] -- building graph and loading fixture mission..."
     )
 
     initial_state = sample_mission_state()
     initial_state_dict = initial_state.model_dump()
 
     audit_holder: dict[str, str | None] = {"id": None}
-    graph = build_graph(audit_run_id_holder=audit_holder)
 
     agent_run_id: str | None = None
     if not args.no_db:
-        from .audit import begin_run, end_run, write_rankings
+        from .audit import begin_run
 
         try:
             agent_run_id = await begin_run(
@@ -193,6 +364,11 @@ async def _async_main(args: argparse.Namespace) -> int:
                     "location": list(initial_state.location),
                     "search_radius_m": initial_state.search_radius_m,
                     "member_pref_count": len(initial_state.member_prefs),
+                    "mode": (
+                        "reject_twice" if args.reject_twice
+                        else "reject" if args.reject
+                        else "auto_approve"
+                    ),
                 },
             )
             audit_holder["id"] = agent_run_id
@@ -206,16 +382,11 @@ async def _async_main(args: argparse.Namespace) -> int:
 
     final_payload: Any
     error_str: str | None = None
+    iteration_log: list[dict[str, Any]] = []
     try:
-        if args.verbose:
-            console.print("[dim]Streaming node updates (verbose mode)...[/dim]\n")
-            i = 0
-            async for chunk in graph.astream(initial_state_dict, stream_mode="updates"):
-                i += 1
-                _dump_step(console, i, chunk)
-            final_payload = await graph.ainvoke(initial_state_dict)
-        else:
-            final_payload = await graph.ainvoke(initial_state_dict)
+        final_payload, iteration_log = await _run_with_hitl(
+            console, args, audit_holder, initial_state_dict
+        )
     except Exception as exc:
         error_str = f"{type(exc).__name__}: {exc}"
         if agent_run_id:
@@ -231,6 +402,7 @@ async def _async_main(args: argparse.Namespace) -> int:
         constraints = final_state.group_constraints
         candidates = final_state.candidates
         shortlist = final_state.shortlist
+        winner = final_state.winner
     else:
         constraints = final_payload.get("group_constraints") if isinstance(final_payload, dict) else None
         raw_cands = final_payload.get("candidates", []) if isinstance(final_payload, dict) else []
@@ -243,11 +415,23 @@ async def _async_main(args: argparse.Namespace) -> int:
             c if isinstance(c, CandidatePlace) else CandidatePlace.model_validate(c)
             for c in raw_short
         ]
+        raw_winner = final_payload.get("winner") if isinstance(final_payload, dict) else None
+        if raw_winner is None:
+            winner = None
+        elif isinstance(raw_winner, CandidatePlace):
+            winner = raw_winner
+        else:
+            try:
+                winner = CandidatePlace.model_validate(raw_winner)
+            except Exception:  # noqa: BLE001
+                winner = None
 
     if agent_run_id and not args.no_db:
         from .audit import end_run, write_rankings
 
-        # Top-5 = the explained shortlist (or fall back to scored candidates).
+        # Final batch of rankings = the explained shortlist after the
+        # last (approved) iteration. Per-iteration rankings were written
+        # inside _run_with_hitl; this is the canonical "final" batch.
         top5 = shortlist if shortlist else candidates[:5]
         try:
             await write_rankings(
@@ -265,6 +449,11 @@ async def _async_main(args: argparse.Namespace) -> int:
                 output_dict={
                     "candidate_count": len(candidates),
                     "shortlist_size": len(shortlist),
+                    "iterations": len(iteration_log),
+                    "final_winner": (
+                        {"name": winner.name, "score": winner.score}
+                        if winner is not None else None
+                    ),
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -274,6 +463,35 @@ async def _async_main(args: argparse.Namespace) -> int:
     _pretty_print_constraints(console, constraints)
     console.print()
     _pretty_print_top5(console, shortlist or candidates)
+
+    # Iteration history
+    if iteration_log:
+        hist = Table(title="HITL iteration history", show_lines=False)
+        hist.add_column("iter", justify="right")
+        hist.add_column("proposed winner")
+        hist.add_column("decision")
+        hist.add_column("reason")
+        for entry in iteration_log:
+            pw = entry.get("proposed_winner") or {}
+            name = pw.get("name", "-") if isinstance(pw, dict) else "-"
+            hist.add_row(
+                str(entry["iteration"]),
+                str(name),
+                str(entry["decision"]),
+                str(entry.get("reason") or "-"),
+            )
+        console.print()
+        console.print(hist)
+
+    if winner is not None:
+        console.print()
+        console.print(
+            Panel(
+                f"[bold cyan]{winner.name}[/bold cyan] (score {winner.score:.2f})",
+                title="Final winner",
+                expand=False,
+            )
+        )
 
     if agent_run_id and not args.no_db:
         console.print()
@@ -287,7 +505,7 @@ async def _async_main(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run the C3-slice VibeBite recommend graph.")
+    parser = argparse.ArgumentParser(description="Run the C4-slice VibeBite recommend graph.")
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -296,7 +514,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--no-db",
         action="store_true",
-        help="Run in offline mode — no DB reads/writes (uses in-memory state only).",
+        help="Run in offline mode -- no DB reads/writes (uses in-memory state only).",
+    )
+    parser.add_argument(
+        "--reject",
+        "--reject-winner",
+        dest="reject",
+        action="store_true",
+        help="Simulate rejecting the first proposed winner (loosens budget then approves).",
+    )
+    parser.add_argument(
+        "--reject-twice",
+        dest="reject_twice",
+        action="store_true",
+        help="Simulate two rejections in a row; auto-approves the third proposal.",
     )
     args = parser.parse_args(argv)
 

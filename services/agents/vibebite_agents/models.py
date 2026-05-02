@@ -209,6 +209,12 @@ class ResilientLLM:
                     "rate limit",
                     "503",
                     "timeout",
+                    "api_key_invalid",
+                    "api key not found",
+                    "permission_denied",
+                    "401",
+                    "403",
+                    "400",
                 )
             )
             if not transient:
